@@ -1,15 +1,64 @@
 # Python virtualenv
 venv*/
+venv/
+env/
+ENV/
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 
 # Logs
 *.log
 *.out
 *.err
 
-# VSCode
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+*.env
 
 # Sample data (lớn)
 sample_data/
-data/logs/actions.jsonl
+
+# Generated data (parquet, features, models, scores)
+data/
+!data/.gitkeep
+
+# Forensic bundles
+bundles/
+!bundles/.gitkeep
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Model artifacts
+*.joblib
+*.pkl
+*.h5
+*.hdf5
+
+# Parquet files (generated)
+*.parquet
+
+# Temporary files
+*.tmp
+*.temp
+*.bak

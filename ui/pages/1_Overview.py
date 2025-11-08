@@ -8,62 +8,52 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
 from models.utils import get_paths
+from explain.thresholding import compute_threshold
 
 st.set_page_config(page_title="Loganom AI", layout="wide")
 
 st.title("Loganom AI")
 
-st.markdown(
-    """
-    Loganom‑AI là hệ thống phát hiện bất thường (tương tự SIEM, không phải IPS) cho log bảo mật.
-    Hiện tại dự án sử dụng Isolation Forest (IF) để chấm điểm bất thường, SHAP để giải thích, và SOAR (respond) để mô phỏng hành động ứng phó cục bộ. LSTM (time‑series) đã tích hợp nhưng tạm tắt do giới hạn RAM.
-    """
-)
+st.caption("Logs → ECS → Features → IF Scoring → Alerts/SHAP → Bundle → (SOAR)")
 
-with st.expander("Bắt đầu", expanded=True):
-    st.code(
-        """
-        python -m cli.anom_score score
-        python -m cli.anom_score respond
-        streamlit run ui/streamlit_app.py
-        """,
-        language="bash",
-    )
 
-# Trạng thái dữ liệu gần đây
 paths = get_paths()
-scores_dir = Path(paths["scores_dir"]) if "scores_dir" in paths else None
-logs_dir = Path(paths.get("logs_dir", "data/logs"))
-audit_file = logs_dir / "actions.jsonl"
-
-col_a, col_b, col_c = st.columns(3)
-with col_a:
-    st.subheader("Scores status")
-    if scores_dir and scores_dir.exists():
-        parquet_files = list(scores_dir.rglob("*.parquet"))
-        if parquet_files:
-            latest = max(parquet_files, key=lambda p: p.stat().st_mtime)
-            ts = datetime.fromtimestamp(latest.stat().st_mtime)
-            st.success(f"Tìm thấy {len(parquet_files)} file điểm. Mới nhất: {latest.name} ({ts:%Y-%m-%d %H:%M:%S})")
-        else:
-            st.warning("Chưa có file .parquet trong thư mục scores.")
-    else:
-        st.info("Chưa tạo thư mục scores. Hãy chạy: python -m cli.anom_score score")
-
-with col_b:
-    st.subheader("SOAR audit")
-    if audit_file.exists():
-        ts = datetime.fromtimestamp(audit_file.stat().st_mtime)
-        size_kb = max(1, audit_file.stat().st_size // 1024)
-        st.success(f"actions.jsonl: ~{size_kb} KB, cập nhật: {ts:%Y-%m-%d %H:%M:%S}")
-        st.caption("Xem chi tiết tại trang SOAR Actions.")
-    else:
-        st.info("Chưa có audit. Chạy: python -m cli.anom_score respond hoặc dùng nút trên trang SOAR Actions.")
-
-with col_c:
-    st.subheader("LSTM (tùy chọn)")
-    st.write("Đã tích hợp LSTM Autoencoder, nhưng với bộ dữ liệu rất lớn cần RAM cao. Tạm thời dùng IF.")
 
 st.divider()
-st.info("Nếu muốn chạy nhanh toàn pipeline demo (IF): python -m cli.anom_score demo")
+
+# Tổng tiến trình và biểu đồ điểm theo thời gian
+scores_path = Path(paths["scores_dir"]) / "scores.parquet"
+if not scores_path.exists():
+    st.warning("Chưa có điểm bất thường. Hãy chạy: python -m cli.anom_score featurize && python -m cli.anom_score score")
+else:
+    df = pd.read_parquet(scores_path)
+    if "@timestamp" in df.columns:
+        df["@timestamp"] = pd.to_datetime(df["@timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["@timestamp"]).sort_values("@timestamp")
+
+    # Metrics tổng quan
+    total_events = len(df)
+    time_range = (df["@timestamp"].min(), df["@timestamp"].max()) if len(df) else (None, None)
+    thr, _ = compute_threshold(df["anom.score"]) if "anom.score" in df.columns and len(df) else (None, 0)
+    alert_count = int((df["anom.score"] >= thr).sum()) if thr is not None else 0
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Events processed", f"{total_events:,}")
+    if time_range[0] is not None:
+        m2.metric("Time range",
+                  f"{time_range[0]:%Y-%m-%d %H:%M} → {time_range[1]:%Y-%m-%d %H:%M}")
+    m3.metric("Alerts ≥ threshold", f"{alert_count}")
+
+    # Biểu đồ timeline điểm + ngưỡng
+    if total_events > 0 and "anom.score" in df.columns:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.plot(df["@timestamp"], df["anom.score"], linewidth=1)
+        if thr is not None:
+            ax.axhline(thr, color="red", linestyle="--", linewidth=1, label=f"threshold={thr:.3f}")
+            ax.legend(loc="upper right")
+        ax.set_ylabel("Anomaly score")
+        ax.set_xlabel("Time")
+        st.pyplot(fig)
