@@ -33,79 +33,7 @@ Dự án này là một hệ thống end-to-end offline giúp:
 - 🖥️ **Streamlit Dashboard**: Giao diện web để xem timeline, alerts, và tải bundles
 - ⚡ **CLI Tools**: Typer-based CLI để chạy pipeline từng bước hoặc end-to-end
 
-## 🚀 Quick Start
-
-### Yêu cầu
-
-- Python 3.12+
-- Windows/Linux/macOS
-
-### Cài đặt
-
-1. **Clone repository:**
-```bash
-git clone https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent.git
-cd Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent
-```
-
-2. **Tạo virtual environment:**
-```powershell
-# Windows (PowerShell)
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-
-# Linux/macOS
-python -m venv venv
-source venv/bin/activate
-```
-
-3. **Cài đặt dependencies:**
-```bash
-pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
-```
-
-4. **Cấu hình môi trường (tùy chọn):**
-Tạo file `.env` trong thư mục gốc để cấu hình API keys cho AI Agent:
-```env
-# AI Agent Configuration (optional)
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
-
-# DeepSeek Configuration
-DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
-
-# Gemini Configuration
-GEMINI_MODEL=gemini-1.5-flash
-```
-
-### Chạy Demo
-
-1. **Chạy toàn bộ pipeline:**
-```bash
-python -m cli.anom_score demo
-```
-
-Lệnh này sẽ tự động:
-- Ingest logs từ `sample_data/`
-- Chuẩn hóa về ECS và lưu Parquet
-- Tạo features (time windows, entropy, sessions)
-- Train Isolation Forest model
-- Score anomalies
-- Tạo forensic bundles cho top alerts
-
-2. **Khởi động Streamlit Dashboard:**
-```bash
-streamlit run ui/streamlit_app.py
-```
-
-Truy cập http://localhost:8501 để xem:
-- **Overview**: Timeline điểm anomaly, tổng số events
-- **Hosts**: Phân tích theo host, trends
-- **Alerts**: Top alerts với SHAP explanations, raw context, và tải bundles
-
-## 📖 Hướng dẫn sử dụng chi tiết
+## 📖 Hướng dẫn sử dụng
 
 ### Chạy từng bước
 
@@ -247,26 +175,11 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 6. Tạo bundles: `python -m cli.anom_score bundle`
 7. Reload Streamlit dashboard
 
-## 🔐 Security Notes
-
-- File `.env` chứa API keys **KHÔNG** được commit vào git
-- Các thư mục `data/` và `bundles/` chứa dữ liệu nhạy cảm và được gitignored
-- Forensic bundles chứa SHA256 manifest để đảm bảo integrity
-
 ## ⚖️ Copyright
 
 - **Copyright**: All code is copyright © 2024 thanhpc187
 - **License**: MIT License (see [LICENSE](LICENSE))
 - **Attribution**: Please credit the original author (thanhpc187) when using this code
-
-## 📚 Tài liệu thêm
-
-Xem file `PROJECT_TECH_REVIEW.md` để biết chi tiết về:
-- Kiến trúc hệ thống
-- Data flow và pipeline
-- Feature engineering
-- Model training và inference
-- Forensic bundle structure
 
 ## 🤝 Contributing
 
@@ -284,17 +197,6 @@ If you use this code, please credit the original author (thanhpc187) and include
 
 - GitHub: [@thanhpc187](https://github.com/thanhpc187)
 - Repository: [Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent](https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent)
-
-See [AUTHORS.md](AUTHORS.md) for attribution requirements and academic use guidelines.
-
-## 🙏 Acknowledgments
-
-- Elastic Common Schema (ECS) for log normalization
-- scikit-learn for Isolation Forest implementation
-- SHAP for model explainability
-- Streamlit for the dashboard framework
-
----
 
 **Lưu ý**: Dự án này là một demo/POC. Để sử dụng trong môi trường production, cần:
 - Mở rộng dataset và features
