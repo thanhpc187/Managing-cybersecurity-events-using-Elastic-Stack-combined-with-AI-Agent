@@ -253,12 +253,11 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 - Các thư mục `data/` và `bundles/` chứa dữ liệu nhạy cảm và được gitignored
 - Forensic bundles chứa SHA256 manifest để đảm bảo integrity
 
-## ⚖️ Copyright & Attribution
+## ⚖️ Copyright
 
 - **Copyright**: All code is copyright © 2024 thanhpc187
 - **License**: MIT License (see [LICENSE](LICENSE))
 - **Attribution**: Please credit the original author (thanhpc187) when using this code
-- **See Also**: [AUTHORS.md](AUTHORS.md) and [COPYRIGHT_NOTICE.md](COPYRIGHT_NOTICE.md)
 
 ## 📚 Tài liệu thêm
 
