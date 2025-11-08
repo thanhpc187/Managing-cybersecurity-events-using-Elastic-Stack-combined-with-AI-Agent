@@ -1,5 +1,6 @@
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
+import logging
 import pandas as pd
 import re
 
@@ -7,6 +8,8 @@ from models.utils import get_paths, ensure_dir
 from features.windowing import add_time_window_counts
 from features.entropy import shannon_entropy
 from features.sessionize import sessionize_network
+
+logger = logging.getLogger(__name__)
 
 def _list_sources(ecs_root: Path) -> List[str]:
     if not ecs_root.exists():
@@ -25,17 +28,21 @@ def _available_dates(ecs_root: Path, sources: List[str]) -> List[str]:
     return sorted(dts)
 
 def _read_partition(ecs_root: Path, dt: str, sources: List[str]) -> pd.DataFrame:
+    """Đọc tất cả parquet files từ các sources cho một ngày cụ thể."""
     parts = []
     for s in sources:
         parts.extend((ecs_root / s / f"dt={dt}").glob("*.parquet"))
     if not parts:
         return pd.DataFrame()
+    
     frames = []
     for p in parts:
         try:
             frames.append(pd.read_parquet(p))
-        except Exception:
+        except (OSError, ValueError) as e:
+            logger.warning(f"Không thể đọc {p}: {e}")
             continue
+    
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -66,12 +73,15 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             # Không có timestamp thì bỏ qua ngày này
             continue
 
-        # Bổ sung cột thiếu
-        for col in [
+        # Bổ sung cột thiếu cần thiết cho feature engineering
+        required_cols = [
             "event.code", "event.outcome", "destination.port",
-            "process.command_line", "host.name", "user.name",
-            "source.ip", "destination.ip"
-        ]:
+            "process.command_line", "process.name",  # process.name cần cho CBS windowing
+            "host.name", "user.name",
+            "source.ip", "source.port",  # Cần cho sessionize
+            "destination.ip", "network.transport"  # Cần cho sessionize
+        ]
+        for col in required_cols:
             if col not in ecs.columns:
                 ecs[col] = None
 
@@ -88,26 +98,41 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
 
         # Entropy: ưu tiên command_line; nếu thiếu, dùng message (CBS thường không có command_line)
         ecs["process.command_line_entropy"] = ecs["process.command_line"].astype(str).apply(shannon_entropy)
-        ecs["message_entropy"] = ecs.get("message", pd.Series([None] * len(ecs))).astype(str).apply(shannon_entropy)
-        # Fallback entropy cho mô hình tổng quát
-        cmd_raw = ecs.get("process.command_line")
-        has_cmd = cmd_raw.astype(str).str.len() > 0 if cmd_raw is not None else pd.Series([False] * len(ecs))
-        ecs["text_entropy"] = ecs["process.command_line_entropy"].where(has_cmd, ecs["message_entropy"])  # type: ignore[arg-type]
+        
+        # Message entropy (an toàn với cột không tồn tại)
+        if "message" in ecs.columns:
+            ecs["message_entropy"] = ecs["message"].astype(str).apply(shannon_entropy)
+        else:
+            ecs["message_entropy"] = 0.0
+        
+        # Fallback entropy cho mô hình tổng quát: ưu tiên command_line, fallback message
+        has_cmd = ecs["process.command_line"].astype(str).str.len() > 0
+        ecs["text_entropy"] = ecs["process.command_line_entropy"].where(has_cmd, ecs["message_entropy"])
 
         # CBS-specific flags from message contents
         # cbs_failed: dòng có Error/Failed/hex code 0x.. trong CBS
-        msg_series = ecs.get("message", pd.Series([None] * len(ecs))).astype(str)
-        is_cbs = (
-            ecs.get("event.module", pd.Series([None] * len(ecs))).astype(str).str.lower().eq("windows")
-            & ecs.get("event.dataset", pd.Series([None] * len(ecs))).astype(str).str.lower().eq("cbs")
-        )
         err_re = re.compile(r"(?i)(fail|error|0x[0-9a-f]{2,})")
-        ecs["cbs_failed"] = (is_cbs & msg_series.str.contains(err_re)).fillna(False).astype(int)
+        
+        # Kiểm tra CBS event (an toàn với cột không tồn tại)
+        is_cbs = pd.Series([False] * len(ecs), dtype=bool)
+        if "event.module" in ecs.columns and "event.dataset" in ecs.columns:
+            is_cbs = (
+                ecs["event.module"].astype(str).str.lower().eq("windows")
+                & ecs["event.dataset"].astype(str).str.lower().eq("cbs")
+            )
+        
+        # Kiểm tra message có chứa error pattern
+        has_error = pd.Series([False] * len(ecs), dtype=bool)
+        if "message" in ecs.columns:
+            has_error = ecs["message"].astype(str).str.contains(err_re, na=False)
+        
+        ecs["cbs_failed"] = (is_cbs & has_error).astype(int)
 
-        # Sessionize (an toàn với try)
+        # Sessionize (an toàn với exception)
         try:
             ecs = sessionize_network(ecs)
-        except Exception:
+        except (ValueError, KeyError, AttributeError) as e:
+            logger.warning(f"Lỗi sessionize cho dt={dt}: {e}. Gán session.id=None")
             if "session.id" not in ecs.columns:
                 ecs["session.id"] = None
 
@@ -122,26 +147,27 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             ecs = add_time_window_counts(ecs, ["process.name"], "@timestamp", flag, [1, 5, 15])
 
         # Chọn cột features đúng tên
-        feature_cols = [
+        # Base features
+        base_features = [
             "login_failed",
             "conn_suspicious",
-            # Entropy tổng quát (ưu tiên dùng trong model mới vì phù hợp cả CBS)
-            "text_entropy",
-            # Giữ các cột gốc để tương thích ngược và cho ablation
-            "process.command_line_entropy",
+            "text_entropy",  # Entropy tổng quát (ưu tiên dùng trong model mới vì phù hợp cả CBS)
+            "process.command_line_entropy",  # Giữ để tương thích ngược và cho ablation
             "message_entropy",
-            # CBS flags
             "cbs_failed",
         ]
-        for w in [1, 5, 15]:
-            for flag in ["login_failed", "conn_suspicious"]:
+        
+        # Window count features
+        window_features = []
+        windows = [1, 5, 15]
+        flags_for_windowing = ["login_failed", "conn_suspicious", "cbs_failed"]
+        for w in windows:
+            for flag in flags_for_windowing:
                 col = f"{flag}_count_{w}m"
                 if col in ecs.columns:
-                    feature_cols.append(col)
-            for flag in ["cbs_failed"]:
-                col = f"{flag}_count_{w}m"
-                if col in ecs.columns:
-                    feature_cols.append(col)
+                    window_features.append(col)
+        
+        feature_cols = base_features + window_features
 
         # ID columns
         id_cols = ["@timestamp", "host.name", "user.name", "source.ip", "destination.ip", "session.id"]
@@ -157,9 +183,10 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
         out_path = out_dir / "part.parquet"
         try:
             out_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        feat.to_parquet(out_path, index=False)
+            feat.to_parquet(out_path, index=False)
+        except OSError as e:
+            logger.error(f"Không thể ghi {out_path}: {e}")
+            continue
 
         # Lấy mẫu để ghép ra features.parquet
         if sample_per_day > 0 and len(feat) > 0:
