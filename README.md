@@ -253,6 +253,13 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 - Các thư mục `data/` và `bundles/` chứa dữ liệu nhạy cảm và được gitignored
 - Forensic bundles chứa SHA256 manifest để đảm bảo integrity
 
+## ⚖️ Copyright & Attribution
+
+- **Copyright**: All code is copyright © 2024 thanhpc187
+- **License**: MIT License (see [LICENSE](LICENSE))
+- **Attribution**: Please credit the original author (thanhpc187) when using this code
+- **See Also**: [AUTHORS.md](AUTHORS.md) and [COPYRIGHT_NOTICE.md](COPYRIGHT_NOTICE.md)
+
 ## 📚 Tài liệu thêm
 
 Xem file `PROJECT_TECH_REVIEW.md` để biết chi tiết về:
@@ -268,13 +275,18 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📝 License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) file for details.
 
-## 👤 Author
+If you use this code, please credit the original author (thanhpc187) and include a link to this repository.
 
-**thanhpc187**
+## 👤 Author & Copyright
+
+**Copyright (c) 2024 thanhpc187**
 
 - GitHub: [@thanhpc187](https://github.com/thanhpc187)
+- Repository: [Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent](https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent)
+
+See [AUTHORS.md](AUTHORS.md) for attribution requirements and academic use guidelines.
 
 ## 🙏 Acknowledgments
 

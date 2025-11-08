@@ -1,3 +1,11 @@
+"""
+Feature engineering for anomaly detection.
+
+Copyright (c) 2024 thanhpc187
+See LICENSE file for license information.
+Original repository: https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent
+"""
+
 from pathlib import Path
 from typing import List
 import logging

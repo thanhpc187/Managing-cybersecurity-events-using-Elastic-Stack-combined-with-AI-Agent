@@ -1,3 +1,11 @@
+"""
+CLI commands for anomaly detection pipeline.
+
+Copyright (c) 2024 thanhpc187
+See LICENSE file for license information.
+Original repository: https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent
+"""
+
 import typer
 import logging
 from pathlib import Path
