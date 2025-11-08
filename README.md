@@ -152,17 +152,6 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
     └── alert_*.zip
 ```
 
-## 🔧 Troubleshooting
-
-| Vấn đề | Cách xử lý |
-|--------|-----------|
-| `No module named 'cli'` | Đảm bảo đang ở thư mục gốc repo và có `__init__.py` trong các thư mục |
-| Không thấy dữ liệu mới | Reset phần liên quan: `ingest --reset`, `featurize --reset`, `score --reset` |
-| Không tạo bundle | Kiểm tra `data/scores/scores.parquet` tồn tại và có alerts vượt ngưỡng |
-| CSV bị skip | Đảm bảo CSV có cột thời gian hoặc set `CSV_TIME_COL` environment variable |
-| SHAP lỗi | Retrain model: `python -m cli.anom_score train` |
-| AI Agent không hoạt động | Kiểm tra API keys trong `.env` hoặc environment variables |
-
 ## 🎯 Workflow
 
 ### Quy trình xử lý dữ liệu mới
