@@ -23,6 +23,7 @@ from pipeline.alerting import select_alerts
 from pipeline.bundle import build_bundle_for_alert
 from explain.shap_explain import top_shap_for_rows
 from ai.agent import analyze_alert
+from ai.mitre_mapper import load_mitre_mapping, map_to_mitre
 
 # ---------------------------------------------------------
 # Cấu hình trang
@@ -79,6 +80,15 @@ def _detect_shell(cmd: str) -> str:
         "wevtutil", "stop-process", "get-filehash", "set-netfirewallprofile",
     ]
     return "powershell" if any(k in c for k in ps_keys) else "bash"
+
+def _dedup_keep_order(items):
+    seen = set()
+    out = []
+    for it in items:
+        if it and it not in seen:
+            out.append(it)
+            seen.add(it)
+    return out
 
 
 def _to_dataframe(items):
@@ -151,6 +161,51 @@ if not top.empty:
     top["host.name"] = top["host.name"].fillna("unknown")
     top["user.name"] = top["user.name"].fillna("unknown")
 
+# Tính MITRE mapping cho bảng alerts
+mapping_cfg = load_mitre_mapping()
+if not top.empty:
+    mitre_tactics = []
+    mitre_techs = []
+    for _, r in top.iterrows():
+        hits = map_to_mitre(r.to_dict(), r.to_dict(), mapping_cfg)
+        tactics = _dedup_keep_order([h.get("tactic") for h in hits if h.get("tactic")])
+        techs = _dedup_keep_order([h.get("technique") for h in hits if h.get("technique")])
+        mitre_tactics.append(", ".join(tactics))
+        mitre_techs.append(", ".join(techs))
+    top = top.copy()
+    top["mitre.tactics"] = mitre_tactics
+    top["mitre.techniques"] = mitre_techs
+
+# Bộ lọc event.action / event.module
+col_f1, col_f2 = st.columns(2)
+if "event.action" in top.columns:
+    with col_f1:
+        actions = sorted([a for a in top["event.action"].dropna().unique()])
+        selected_actions = st.multiselect("Lọc event.action", actions, default=actions[:0])
+        if selected_actions:
+            top = top[top["event.action"].isin(selected_actions)]
+if "event.module" in top.columns:
+    with col_f2:
+        modules = sorted([m for m in top["event.module"].dropna().unique()])
+        selected_modules = st.multiselect("Lọc event.module", modules, default=modules[:0])
+        if selected_modules:
+            top = top[top["event.module"].isin(selected_modules)]
+
+# Bộ lọc MITRE
+col_f3, col_f4 = st.columns(2)
+if "mitre.tactics" in top.columns:
+    with col_f3:
+        tactic_vals = sorted({t.strip() for v in top["mitre.tactics"].dropna() for t in str(v).split(",") if t.strip()})
+        chosen_tactics = st.multiselect("Lọc MITRE tactic", tactic_vals, default=[])
+        if chosen_tactics:
+            top = top[top["mitre.tactics"].apply(lambda x: any(t in str(x) for t in chosen_tactics))]
+if "mitre.techniques" in top.columns:
+    with col_f4:
+        tech_vals = sorted({t.strip() for v in top["mitre.techniques"].dropna() for t in str(v).split(",") if t.strip()})
+        chosen_techs = st.multiselect("Lọc MITRE technique", tech_vals, default=[])
+        if chosen_techs:
+            top = top[top["mitre.techniques"].apply(lambda x: any(t in str(x) for t in chosen_techs))]
+
 st.caption(f"Threshold: {thr:.4f}")
 
 if top.empty:
@@ -158,8 +213,34 @@ if top.empty:
     st.stop()
 
 # Bảng alerts
-cols_show = [c for c in ["@timestamp", "host.name", "user.name", "source.ip", "destination.ip", "anom.score"] if c in top.columns]
+cols_show = [c for c in ["@timestamp", "host.name", "user.name", "source.ip", "destination.ip", "anom.score", "mitre.tactics", "mitre.techniques"] if c in top.columns]
 st.dataframe(top[cols_show], use_container_width=True, hide_index=True)
+
+# Đồ thị drop/allow (nếu có)
+if "event.action" in top.columns:
+    top_act = top.copy()
+    top_act["event.action"] = top_act["event.action"].astype(str).str.lower()
+    deny = top_act[top_act["event.action"].isin(["deny", "drop", "blocked", "reset"])].resample("1T", on="@timestamp").size()
+    allow = top_act[top_act["event.action"].isin(["allow", "allowed", "permit"])].resample("1T", on="@timestamp").size()
+    if len(deny) or len(allow):
+        st.subheader("Firewall drop/allow theo thời gian")
+        figd, axd = plt.subplots(figsize=(8, 3))
+        if len(deny):
+            axd.plot(deny.index, deny.values, label="deny/drop", color="#ef4444")
+        if len(allow):
+            axd.plot(allow.index, allow.values, label="allow", color="#10b981")
+        axd.legend()
+        axd.set_ylabel("Count per minute")
+        axd.set_xlabel("Time")
+        st.pyplot(figd)
+
+# Bảng IPS alert (nếu có)
+if "event.module" in top.columns:
+    ips_top = top[top["event.module"].astype(str).str.lower() == "ips"]
+    if not ips_top.empty:
+        st.subheader("IPS alerts (top-N)")
+        cols_ips = [c for c in ["@timestamp", "rule.name", "event.severity", "source.ip", "destination.ip", "anom.score"] if c in ips_top.columns]
+        st.dataframe(ips_top[cols_ips], use_container_width=True, hide_index=True)
 
 # Chọn 1 alert để xem chi tiết
 idx = st.number_input("Chọn alert (chỉ số hàng)", min_value=0, max_value=len(top) - 1, value=0, step=1)
@@ -256,7 +337,7 @@ if bundle_candidate.exists():
         except Exception:
             shap_info = {"top_features": []}
         try:
-            ai_json = analyze_alert(row.to_dict(), shap_info.get("top_features", []), [])
+            ai_json = analyze_alert(row.to_dict(), shap_info.get("top_features", []), [], row.to_dict())
         except Exception:
             ai_json = None
 

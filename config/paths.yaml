@@ -6,3 +6,13 @@ models_dir: data/models
 scores_dir: data/scores
 bundles_dir: bundles
 logs_dir: data/logs
+# Network / ingestion endpoints
+elastic_host: http://10.10.20.100:9200
+elastic_user: ""
+elastic_password: ""
+elastic_index_patterns:
+  - "lab-logs-network-syslog-*"
+  - "siem-*"
+fortigate_syslog_port: 5514
+ips_syslog_port: 514
+beats_port: 5044

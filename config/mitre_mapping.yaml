@@ -1,0 +1,34 @@
+# MITRE ATT&CK mapping rules
+# Mỗi rule gồm: id, description, tactic, technique, subtechnique (optional), conditions
+# conditions hỗ trợ:
+# - So sánh số với prefix: >, >=, <, <=, == (ví dụ "> 10")
+# - Khớp chuỗi hoặc danh sách giá trị (case-insensitive cho string)
+# - Với port/IP, dùng list hoặc một giá trị đơn
+
+- id: rule_bruteforce
+  description: "Login failures vượt ngưỡng, nghi ngờ brute force"
+  tactic: "Credential Access"
+  technique: "T1110"
+  subtechnique: "T1110.001"
+  conditions:
+    login_failed_count_5m: "> 10"
+    login_failed_ratio_5m: "> 0.8"
+
+- id: rule_remote_service
+  description: "Kết nối dịch vụ từ xa (RDP/SSH/SMB) được allow"
+  tactic: "Lateral Movement"
+  technique: "T1021"
+  conditions:
+    destination.port: [22, 3389, 445]
+    event.action: "allow"
+
+- id: rule_port_scan
+  description: "Nhiều đích/cổng trong thời gian ngắn (port scan)"
+  tactic: "Discovery"
+  technique: "T1046"
+  conditions:
+    uniq_dport_per_src_1m: "> 20"
+    conn_suspicious: "== 1"
+
+# Có thể bổ sung rule khác tại đây (ví dụ C2 beacon, exfil, webshell, ...)
+

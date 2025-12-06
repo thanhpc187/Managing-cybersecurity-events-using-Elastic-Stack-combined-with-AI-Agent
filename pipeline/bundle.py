@@ -83,7 +83,7 @@ def build_bundle_for_alert(alert_row: pd.Series, idx: int, threshold: float) -> 
     write_json(model_meta_path, model_meta)
 
     # 5) AI agent analysis (JSON + Markdown)
-    ai_analysis = analyze_alert(alert_row, shap_top, raw_slice)
+    ai_analysis = analyze_alert(alert_row, shap_top, raw_slice, feat_row)
     ai_json_path = tmp_dir / "ai_analysis.json"
     write_json(ai_json_path, ai_analysis)
     ai_md_path = tmp_dir / "ai_analysis.md"
@@ -116,7 +116,12 @@ def build_bundle_for_alert(alert_row: pd.Series, idx: int, threshold: float) -> 
     write_json(coc_path, coc)
 
     # Bundle manifest (hash every file inside the bundle)
-    manifest = {"files": {}}
+    manifest = {
+        "files": {},
+        "mitre_attack": ai_analysis.get("mitre_attack", []),
+        "threshold": float(threshold),
+        "alert_score": float(alert_row.get("anom.score", 0)),
+    }
     for p in [
         raw_logs_path,
         features_path_json,

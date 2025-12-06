@@ -14,15 +14,3 @@ scoring:
   # threshold_method: quantile uses (1 - contamination) quantile
   threshold_method: quantile
 
-# LSTM Autoencoder defaults (can be tuned per dataset)
-
-
-lstm_autoencoder:
-  sequence_length: 10
-  epochs: 3
-  batch_size: 64
-  learning_rate: 0.001
-  lstm_units: [64, 32]
-  dropout: 0.2
-
-

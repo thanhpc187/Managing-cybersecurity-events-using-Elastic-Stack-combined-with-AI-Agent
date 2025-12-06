@@ -16,13 +16,14 @@ Dự án này là một hệ thống end-to-end offline giúp:
 
 ## ✨ Tính năng chính
 
-- 🔍 **Multi-source Log Ingestion**: Hỗ trợ Windows Event Logs, Sysmon, Zeek, Syslog
+- 🔍 **Multi-source Log Ingestion**: Hỗ trợ Windows Event Logs, Sysmon, Zeek, Syslog, **FortiGate firewall**, **IPS (Snort/Suricata)**, **Packetbeat/Filebeat/Winlogbeat**
 - 📊 **ECS Normalization**: Chuẩn hóa tất cả log về Elastic Common Schema
 - 🤖 **Anomaly Detection**: Sử dụng Isolation Forest để phát hiện bất thường không cần nhãn
 - 📈 **Feature Engineering**: 
   - Time-window features (1/5/15 phút)
   - Entropy analysis cho command lines
   - Sessionization theo 5-tuple network
+  - **Network metrics**: deny/allow ratio, uniq IP/port per window, bytes/packets per window
 - 🧠 **AI-Powered Analysis**: Tích hợp AI Agent (DeepSeek/Gemini) để phân tích alert và đề xuất hành động
 - 📦 **Forensic Bundles**: Tự động tạo gói pháp chứng với:
   - Raw logs (±5 phút context)
@@ -30,8 +31,8 @@ Dự án này là một hệ thống end-to-end offline giúp:
   - SHAP explanations
   - Model metadata
   - SHA256 manifest
-- 🖥️ **Streamlit Dashboard**: Giao diện web để xem timeline, alerts, và tải bundles
-- ⚡ **CLI Tools**: Typer-based CLI để chạy pipeline từng bước hoặc end-to-end
+- 🖥️ **Streamlit Dashboard**: Giao diện web để xem timeline, alerts, MITRE tactic/technique, và tải bundles
+- ⚡ **CLI Tools**: Typer-based CLI để chạy pipeline từng bước, đánh giá mô hình hoặc end-to-end
 
 ## 📖 Hướng dẫn sử dụng
 
@@ -42,6 +43,9 @@ Thay vì chạy toàn bộ pipeline, bạn có thể chạy từng bước:
 ```bash
 # 1. Ingest logs và chuẩn hóa ECS
 python -m cli.anom_score ingest --reset
+
+# Hoặc ingest trực tiếp từ Elasticsearch
+python -m cli.anom_score ingest --source elasticsearch --elastic-host http://10.10.20.100:9200 --elastic-index-patterns "lab-logs-network-syslog-*,siem-*"
 
 # 2. Tạo features
 python -m cli.anom_score featurize --reset
@@ -54,7 +58,17 @@ python -m cli.anom_score score --reset
 
 # 5. Tạo forensic bundles
 python -m cli.anom_score bundle
+
+# 6. Đánh giá mô hình (cần cột label hoặc file nhãn)
+python -m cli.anom_score evaluate --labels-path data/labels/labels.parquet --label-col label
 ```
+
+## MITRE ATT&CK Mapping
+
+- Rule cấu hình tại `config/mitre_mapping.yaml` (ví dụ: brute force T1110, remote service T1021, port scan T1046).
+- Điều kiện hỗ trợ so sánh số (`>`, `>=`, `<`, `<=`, `==`) và khớp chuỗi/danh sách.
+- AI Agent tự động gán tactic/technique vào `ai_analysis.json`/`.md` trong bundle, đồng thời hiển thị ở UI Alerts (cột `mitre.techniques`) kèm bộ lọc theo tactic/technique.
+- Muốn thêm rule mới: bổ sung mục mới vào YAML với `id/description/tactic/technique/subtechnique/conditions`, không cần sửa code.
 
 ### Thêm dữ liệu mới
 
@@ -79,9 +93,11 @@ python -m cli.anom_score bundle
 Các file cấu hình nằm trong thư mục `config/`:
 
 - **`config/paths.yaml`**: Đường dẫn thư mục (data, models, bundles, ...)
+-   - Thông số mạng: `elastic_host`, `elastic_index_patterns`, `fortigate_syslog_port=5514`, `ips_syslog_port=514`, `beats_port=5044`
 - **`config/models.yaml`**: Tham số mô hình (Isolation Forest, threshold, top_n, ...)
 - **`config/ecs_mapping.yaml`**: Mapping từ raw log fields sang ECS fields
 - **`config/policy.yaml`**: Policy rules cho SOAR actions
+- **`config/mitre_mapping.yaml`**: Rule ánh xạ alert/feature → MITRE ATT&CK; hỗ trợ so sánh số (> >= < <= ==) và khớp chuỗi/danh sách, dễ chỉnh sửa để thêm kỹ thuật mới.
 
 ## 📁 Cấu trúc dự án
 
@@ -104,7 +120,10 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 │   ├── zeek_parser.py
 │   ├── syslog_parser.py
 │   ├── log_parser.py
-│   └── csv_parser.py
+│   ├── csv_parser.py
+│   ├── fortigate_parser.py
+│   ├── ips_parser.py
+│   └── beats_parser.py
 ├── features/                 # Feature engineering
 │   ├── build_features.py
 │   ├── windowing.py
@@ -114,8 +133,7 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 ├── models/                   # ML models
 │   ├── train_if.py          # Isolation Forest training
 │   ├── infer.py             # Inference
-│   ├── lstm_anomaly.py      # LSTM model (optional)
-│   ├── ensemble.py          # Ensemble models
+│   ├── evaluate.py          # Đánh giá TPR/FPR/Precision/Recall/F1
 │   └── utils.py
 ├── explain/                  # Explainability
 │   ├── shap_explain.py      # SHAP explanations
@@ -136,7 +154,6 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 │   │   ├── 1_Overview.py
 │   │   ├── 2_Hosts.py
 │   │   └── 3_Alerts.py
-│   └── disabled_pages/       # Disabled features
 ├── cli/                      # CLI commands
 │   └── anom_score.py
 ├── split_log/                # Log utilities

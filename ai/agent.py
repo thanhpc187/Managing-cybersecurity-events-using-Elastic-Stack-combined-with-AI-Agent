@@ -11,7 +11,12 @@ from __future__ import annotations
 import os
 import re
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
+
+import pandas as pd
+
+from .mitre_mapper import load_mitre_mapping, map_to_mitre
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +231,94 @@ def _suggest_actions(alert: Dict[str, Any]) -> List[str]:
 
     return _dedup_keep_order([a for a in actions if a])
 
+
+# --------- MITRE & correlation helpers ---------
+MITRE_RULES = [
+    ("brute force", "T1110 Brute Force"),
+    ("port scan", "T1046 Network Service Discovery"),
+    ("lateral", "T1021 Remote Services"),
+    ("powershell", "T1059.001 PowerShell"),
+    ("rundll32", "T1218 Signed Binary Proxy Execution"),
+    ("beacon", "TA0011 Command and Control"),
+]
+
+
+def _extract_entities(alert: Dict[str, Any], context_rows: List[Dict[str, Any]]) -> Dict[str, set]:
+    entities = {
+        "src": set(),
+        "dst": set(),
+        "user": set(),
+        "host": set(),
+        "actions": [],
+        "modules": [],
+    }
+    for rec in [alert] + _as_records(context_rows):
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("source.ip"):
+            entities["src"].add(str(rec.get("source.ip")))
+        if rec.get("destination.ip"):
+            entities["dst"].add(str(rec.get("destination.ip")))
+        if rec.get("user.name"):
+            entities["user"].add(str(rec.get("user.name")))
+        if rec.get("host.name"):
+            entities["host"].add(str(rec.get("host.name")))
+        if rec.get("event.action"):
+            entities["actions"].append(str(rec.get("event.action")))
+        if rec.get("event.module"):
+            entities["modules"].append(str(rec.get("event.module")))
+    return entities
+
+
+def _correlate_multisource(alert: Dict[str, Any], context_rows: List[Dict[str, Any]], window_min: int = 10) -> List[str]:
+    out: List[str] = []
+    try:
+        t0 = pd.to_datetime(alert.get("@timestamp"), utc=True, errors="coerce")  # type: ignore
+    except Exception:
+        t0 = None
+    for rec in _as_records(context_rows):
+        if not isinstance(rec, dict):
+            continue
+        ts = rec.get("@timestamp")
+        if t0 is not None and ts is not None:
+            try:
+                ts_dt = pd.to_datetime(ts, utc=True, errors="coerce")  # type: ignore
+                if pd.isna(ts_dt):
+                    continue
+                if abs((ts_dt - t0).total_seconds()) > window_min * 60:
+                    continue
+            except Exception:
+                pass
+        same_src = alert.get("source.ip") and rec.get("source.ip") == alert.get("source.ip")
+        same_dst = alert.get("destination.ip") and rec.get("destination.ip") == alert.get("destination.ip")
+        same_user = alert.get("user.name") and rec.get("user.name") == alert.get("user.name")
+        if same_src or same_dst or same_user:
+            mod = rec.get("event.module") or "unknown"
+            act = rec.get("event.action") or "n/a"
+            out.append(f"{mod}::{act} liên quan cùng IP/user trong {window_min} phút.")
+    return _dedup_keep_order(out)
+
+
+def _map_mitre(alert: Dict[str, Any], shap_items: List[Dict[str, Any]]) -> List[str]:
+    text_blob = " ".join(
+        [
+            str(alert.get("message") or ""),
+            str(alert.get("event.action") or ""),
+            str(alert.get("event.dataset") or ""),
+            str(alert.get("rule.name") or ""),
+            " ".join([str(x.get("feature")) for x in shap_items if isinstance(x, dict)]),
+        ]
+    ).lower()
+    hits = []
+    for pat, tid in MITRE_RULES:
+        if pat in text_blob:
+            hits.append(tid)
+    # Heuristics: port 3389/445 -> lateral movement
+    dport = str(alert.get("destination.port") or "")
+    if dport in ("3389", "445") and "T1021 Remote Services" not in hits:
+        hits.append("T1021 Remote Services")
+    return _dedup_keep_order(hits)
+
 # --------- Gọi LLM ---------
 def _call_deepseek(prompt: str, timeout: int = 30) -> Optional[str]:
     """Gọi DeepSeek API để phân tích alert."""
@@ -305,6 +398,7 @@ def analyze_alert_with_llm(
     alert: Dict[str, Any],
     shap_items: List[Dict[str, Any]],
     context_rows: List[Dict[str, Any]],
+    features_row: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Phân tích alert bằng LLM với fallback: DeepSeek -> Gemini -> Stub.
@@ -336,6 +430,11 @@ def analyze_alert_with_llm(
         text = _call_gemini(prompt)
         provider = "gemini" if text is not None else "stub"
 
+    entities = _extract_entities(alert, context_rows)
+    correlations = _correlate_multisource(alert, context_rows)
+    mitre_hits = _map_mitre(alert, shap_items)
+    mapping_config = load_mitre_mapping()
+    mitre_auto = map_to_mitre(alert, features_row, mapping_config)
     actions = _suggest_actions(alert)
 
     # Helper để lấy giá trị an toàn
@@ -369,7 +468,56 @@ def analyze_alert_with_llm(
         }
 
     risk = _infer_risk_from_text(text, default="LOW")
-    return {
+    # Escalate risk nếu có IPS/C2 hoặc nhiều deny
+    priority = safe_get("event.severity")
+    try:
+        priority_int = int(priority)
+    except Exception:
+        priority_int = None
+    action = str(safe_get("event.action", "")).lower()
+    deny_like = action in ("deny", "drop", "blocked", "reset")
+    if priority_int is not None and priority_int <= 2:
+        risk = "HIGH"
+    elif mitre_hits:
+        risk = "MEDIUM" if risk == "LOW" else risk
+    elif deny_like:
+        risk = "MEDIUM" if risk == "LOW" else risk
+
+    markdown_lines = [
+        f"# Alert tại {safe_get('@timestamp', 'N/A')}",
+        f"- Điểm bất thường: **{safe_float(safe_get('anom.score')):.3f}**",
+        f"- Risk: **{risk}** (provider: {provider})",
+    ]
+    all_mitre = mitre_hits.copy()
+    if mitre_auto:
+        auto_labels = [m.get("technique") for m in mitre_auto if m.get("technique")]
+        all_mitre.extend([a for a in auto_labels if a])
+    if all_mitre:
+        markdown_lines.append("- MITRE: " + ", ".join(_dedup_keep_order(all_mitre)))
+    if correlations:
+        markdown_lines.append("- Tương quan:")
+        for c in correlations[:5]:
+            markdown_lines.append(f"  - {c}")
+    if entities["src"] or entities["dst"]:
+        markdown_lines.append(f"- Src IP: {', '.join(entities['src']) or 'N/A'}; Dst IP: {', '.join(entities['dst']) or 'N/A'}")
+    if actions:
+        markdown_lines.append("- Hành động đề xuất:")
+        for a in actions[:3]:
+            markdown_lines.append(f"  - {a}")
+
+    mitre_payload = []
+    for m in (mitre_auto or []):
+        mitre_payload.append(
+            {
+                "rule_id": m.get("rule_id"),
+                "tactic": m.get("tactic"),
+                "technique": m.get("technique"),
+                "subtechnique": m.get("subtechnique"),
+                "description": m.get("description"),
+            }
+        )
+
+    result = {
         "risk_level": risk,
         "score": safe_float(safe_get("anom.score")),
         "reason": _truncate(text, 1200),
@@ -378,8 +526,28 @@ def analyze_alert_with_llm(
         "raw_text": text,
         "provider": provider,
         "alert_time": str(safe_get("@timestamp", "N/A")),
+        "mitre": mitre_hits,
+        "mitre_attack": mitre_payload,
+        "correlations": correlations,
+        "markdown": "\n".join(markdown_lines),
     }
+    # ECS threat fields (first match if available)
+    if mitre_payload:
+        first = mitre_payload[0]
+        if first.get("tactic"):
+            result["threat.tactic.name"] = first["tactic"]
+        if first.get("technique"):
+            result["threat.technique.name"] = first["technique"]
+            result["threat.technique.id"] = first["technique"]
+        if first.get("subtechnique"):
+            result["threat.technique.subtechnique"] = first["subtechnique"]
+    return result
 
 # Alias tương thích
-def analyze_alert(alert: Dict[str, Any], shap_items: List[Dict[str, Any]], context_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return analyze_alert_with_llm(alert, shap_items, context_rows)
+def analyze_alert(
+    alert: Dict[str, Any],
+    shap_items: List[Dict[str, Any]],
+    context_rows: List[Dict[str, Any]],
+    features_row: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return analyze_alert_with_llm(alert, shap_items, context_rows, features_row)

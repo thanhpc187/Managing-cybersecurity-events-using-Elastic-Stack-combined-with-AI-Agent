@@ -19,6 +19,66 @@ from features.sessionize import sessionize_network
 
 logger = logging.getLogger(__name__)
 
+
+def _add_rolling_nunique(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    ts_col: str,
+    value_col: str,
+    windows_min: list[int],
+    prefix: str,
+) -> pd.DataFrame:
+    """Tính rolling số lượng giá trị duy nhất."""
+    if df.empty or value_col not in df.columns:
+        return df
+    out = df.copy()
+    out[ts_col] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+    out = out.dropna(subset=[ts_col]).sort_values(ts_col)
+    idx = out.set_index(ts_col)
+    for w in windows_min:
+        colname = f"{prefix}_{w}m"
+        try:
+            rolled = (
+                idx.groupby(group_cols)[value_col]
+                .rolling(f"{w}min")
+                .apply(lambda x: x.dropna().nunique(), raw=False)
+                .reset_index(level=group_cols, drop=True)
+            )
+            out[colname] = rolled.values.astype("float64")
+        except Exception:
+            out[colname] = 0.0
+    return out
+
+
+def _add_time_window_sum(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    ts_col: str,
+    value_col: str,
+    windows_min: list[int],
+) -> pd.DataFrame:
+    """Tính rolling sum cho giá trị số (bytes/packets)."""
+    if df.empty or value_col not in df.columns:
+        return df
+    out = df.copy()
+    out[ts_col] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+    out = out.dropna(subset=[ts_col]).sort_values(ts_col)
+    out[value_col] = pd.to_numeric(out[value_col], errors="coerce").fillna(0.0)
+    idx = out.set_index(ts_col)
+    for w in windows_min:
+        colname = f"{value_col}_sum_{w}m"
+        try:
+            rolled = (
+                idx.groupby(group_cols)[value_col]
+                .rolling(f"{w}min")
+                .sum()
+                .reset_index(level=group_cols, drop=True)
+            )
+            out[colname] = rolled.values.astype("float64")
+        except Exception:
+            out[colname] = 0.0
+    return out
+
 def _list_sources(ecs_root: Path) -> List[str]:
     if not ecs_root.exists():
         return []
@@ -83,11 +143,14 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
 
         # Bổ sung cột thiếu cần thiết cho feature engineering
         required_cols = [
-            "event.code", "event.outcome", "destination.port",
+            "event.code", "event.outcome", "event.action", "event.module", "event.dataset", "event.severity",
+            "destination.port", "network.protocol", "network.transport",
             "process.command_line", "process.name",  # process.name cần cho CBS windowing
             "host.name", "user.name",
             "source.ip", "source.port",  # Cần cho sessionize
-            "destination.ip", "network.transport"  # Cần cho sessionize
+            "destination.ip",  # Cần cho sessionize
+            "network.bytes", "network.packets",
+            "rule.id",
         ]
         for col in required_cols:
             if col not in ecs.columns:
@@ -103,6 +166,14 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             (pd.to_numeric(ecs["destination.port"], errors="coerce") == 4444) |
             (ecs["event.outcome"].astype(str) == "S0")
         ).fillna(False).astype(int)
+
+        # Firewall allow/deny flags
+        action_lower = ecs["event.action"].astype(str).str.lower()
+        ecs["action_allow"] = action_lower.isin(["allow", "allowed", "permit"]).astype(int)
+        ecs["action_deny"] = action_lower.isin(["deny", "denied", "drop", "blocked", "reset"]).astype(int)
+
+        # IPS alert flag (Suricata/Snort)
+        ecs["ips_alert"] = ecs["event.module"].astype(str).str.lower().eq("ips").astype(int)
 
         # Entropy: ưu tiên command_line; nếu thiếu, dùng message (CBS thường không có command_line)
         ecs["process.command_line_entropy"] = ecs["process.command_line"].astype(str).apply(shannon_entropy)
@@ -145,20 +216,52 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
                 ecs["session.id"] = None
 
         # Rolling counts theo host và user cho các cờ tổng quát
-        for flag in ["login_failed", "conn_suspicious"]:
+        for flag in ["login_failed", "conn_suspicious", "action_deny", "action_allow", "ips_alert"]:
             ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15])
             ecs = add_time_window_counts(ecs, ["user.name"], "@timestamp", flag, [1, 5, 15])
+            ecs = add_time_window_counts(ecs, ["source.ip"], "@timestamp", flag, [1, 5, 15])
+            ecs = add_time_window_counts(ecs, ["destination.ip"], "@timestamp", flag, [1, 5, 15])
 
         # Rolling counts cho CBS theo host và process.name
         for flag in ["cbs_failed"]:
             ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15])
             ecs = add_time_window_counts(ecs, ["process.name"], "@timestamp", flag, [1, 5, 15])
 
+        # Unique IP/port rolling metrics (network visibility)
+        ecs = _add_rolling_nunique(ecs, ["source.ip"], "@timestamp", "destination.ip", [1, 5, 15], "uniq_dst_per_src")
+        ecs = _add_rolling_nunique(ecs, ["destination.ip"], "@timestamp", "source.ip", [1, 5, 15], "uniq_src_per_dst")
+        ecs = _add_rolling_nunique(ecs, ["source.ip"], "@timestamp", "destination.port", [1, 5, 15], "uniq_dport_per_src")
+
+        # Bytes/packets rolling sums
+        ecs = _add_time_window_sum(ecs, ["host.name"], "@timestamp", "network.bytes", [1, 5, 15])
+        ecs = _add_time_window_sum(ecs, ["host.name"], "@timestamp", "network.packets", [1, 5, 15])
+        ecs = _add_time_window_sum(ecs, ["source.ip"], "@timestamp", "network.bytes", [1, 5, 15])
+        ecs = _add_time_window_sum(ecs, ["source.ip"], "@timestamp", "network.packets", [1, 5, 15])
+        ecs = _add_time_window_sum(ecs, ["destination.ip"], "@timestamp", "network.bytes", [1, 5, 15])
+        ecs = _add_time_window_sum(ecs, ["destination.ip"], "@timestamp", "network.packets", [1, 5, 15])
+
+        # Drop/allow ratio (firewall effectiveness)
+        for w in [1, 5, 15]:
+            allow_col = f"action_allow_count_{w}m"
+            deny_col = f"action_deny_count_{w}m"
+            if allow_col in ecs.columns and deny_col in ecs.columns:
+                ecs[f"deny_ratio_{w}m"] = ecs[deny_col] / (ecs[deny_col] + ecs[allow_col] + 1e-6)
+        # Login failed ratio (bruteforce indicator): failed / (failed + allow + deny)
+        for w in [1, 5, 15]:
+            fail_col = f"login_failed_count_{w}m"
+            allow_col = f"action_allow_count_{w}m"
+            deny_col = f"action_deny_count_{w}m"
+            if fail_col in ecs.columns and allow_col in ecs.columns and deny_col in ecs.columns:
+                ecs[f"login_failed_ratio_{w}m"] = ecs[fail_col] / (ecs[fail_col] + ecs[allow_col] + ecs[deny_col] + 1e-6)
+
         # Chọn cột features đúng tên
         # Base features
         base_features = [
             "login_failed",
             "conn_suspicious",
+            "action_allow",
+            "action_deny",
+            "ips_alert",
             "text_entropy",  # Entropy tổng quát (ưu tiên dùng trong model mới vì phù hợp cả CBS)
             "process.command_line_entropy",  # Giữ để tương thích ngược và cho ablation
             "message_entropy",
@@ -168,17 +271,35 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
         # Window count features
         window_features = []
         windows = [1, 5, 15]
-        flags_for_windowing = ["login_failed", "conn_suspicious", "cbs_failed"]
+        flags_for_windowing = ["login_failed", "conn_suspicious", "cbs_failed", "action_allow", "action_deny", "ips_alert"]
         for w in windows:
             for flag in flags_for_windowing:
                 col = f"{flag}_count_{w}m"
                 if col in ecs.columns:
                     window_features.append(col)
         
-        feature_cols = base_features + window_features
+        # Ratio & unique metrics
+        ratio_features = [c for c in ecs.columns if c.startswith("deny_ratio_")]
+        ratio_features += [c for c in ecs.columns if c.startswith("login_failed_ratio_")]
+        uniq_features = [c for c in ecs.columns if c.startswith("uniq_")]
+        traffic_sums = [c for c in ecs.columns if c.endswith(("_sum_1m", "_sum_5m", "_sum_15m"))]
+
+        feature_cols = base_features + window_features + ratio_features + uniq_features + traffic_sums
 
         # ID columns
-        id_cols = ["@timestamp", "host.name", "user.name", "source.ip", "destination.ip", "session.id"]
+        id_cols = [
+            "@timestamp",
+            "host.name",
+            "user.name",
+            "source.ip",
+            "destination.ip",
+            "session.id",
+            "event.action",
+            "event.module",
+            "event.dataset",
+            "event.severity",
+            "network.protocol",
+        ]
         for c in id_cols:
             if c not in ecs.columns:
                 ecs[c] = None

@@ -31,7 +31,14 @@ def get_paths() -> Dict[str, str]:
     # Convert to absolute paths under project root
     resolved = {}
     for key, rel in cfg.items():
-        resolved[key] = str((PROJECT_ROOT / rel).resolve())
+        if isinstance(rel, list):
+            resolved[key] = rel
+        elif isinstance(rel, (int, float)):
+            resolved[key] = rel
+        elif isinstance(rel, str) and (rel.startswith("http://") or rel.startswith("https://")):
+            resolved[key] = rel
+        else:
+            resolved[key] = str((PROJECT_ROOT / rel).resolve())
     return resolved
 
 

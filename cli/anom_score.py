@@ -10,15 +10,30 @@ import typer
 import logging
 from pathlib import Path
 import shutil
+from typing import Optional, List
 
 app = typer.Typer(help="Loganom AI demo CLI")
 logger = logging.getLogger(__name__)
 
-def _safe_run_ingest():
+def _safe_run_ingest(
+    source: str = "files",
+    elastic_host: Optional[str] = None,
+    elastic_index_patterns: Optional[List[str]] = None,
+    elastic_user: Optional[str] = None,
+    elastic_password: Optional[str] = None,
+    enable_udp: bool = False,
+):
     """Chạy ingest với fallback nếu module không khả dụng."""
     try:
         from pipeline.ingest import ingest_all
-        ingest_all()
+        ingest_all(
+            source=source,
+            elastic_host=elastic_host,
+            elastic_index_patterns=elastic_index_patterns,
+            elastic_user=elastic_user,
+            elastic_password=elastic_password,
+            enable_udp=enable_udp,
+        )
     except ImportError as e:
         logger.warning(f"Không thể import pipeline.ingest: {e}, thử fallback")
         try:
@@ -45,10 +60,26 @@ def _reset_dirs(*dirs: str) -> None:
                 logger.warning(f"Không thể xóa {p}: {e}")
 
 @app.command("ingest")
-def cmd_ingest(reset: bool = typer.Option(False, help="Remove ECS Parquet before ingest")):
+def cmd_ingest(
+    reset: bool = typer.Option(False, help="Remove ECS Parquet before ingest"),
+    source: str = typer.Option("files", help="files | elasticsearch"),
+    elastic_host: str = typer.Option(None, help="Elasticsearch host (vd http://10.10.20.100:9200)"),
+    elastic_index_patterns: str = typer.Option(None, help="Chuỗi phân tách bằng dấu phẩy, vd: siem-*,lab-logs-*"),
+    elastic_user: str = typer.Option(None, help="Elastic username"),
+    elastic_password: str = typer.Option(None, help="Elastic password"),
+    enable_udp: bool = typer.Option(False, help="Bật listener UDP demo cho FortiGate/IPS"),
+):
     if reset:
         _reset_dirs("data/ecs_parquet")
-    _safe_run_ingest()
+    idx_list = [s.strip() for s in elastic_index_patterns.split(",")] if elastic_index_patterns else None
+    _safe_run_ingest(
+        source=source,
+        elastic_host=elastic_host,
+        elastic_index_patterns=idx_list,
+        elastic_user=elastic_user,
+        elastic_password=elastic_password,
+        enable_udp=enable_udp,
+    )
     typer.echo("[ingest] Done.")
 
 @app.command("featurize")
@@ -100,50 +131,28 @@ def cmd_score(reset: bool = typer.Option(False, help="Remove scores before scori
         logger.error(f"Lỗi khi score: {e}")
         raise typer.Exit(code=1)
 
-@app.command("train-lstm")
-def cmd_train_lstm():
-    """Huấn luyện LSTM Autoencoder model."""
+@app.command("evaluate")
+def cmd_evaluate(
+    labels_path: str = typer.Option(None, help="Đường dẫn file nhãn (parquet/csv)"),
+    scores_path: str = typer.Option(None, help="Đường dẫn scores.parquet; mặc định data/scores/scores.parquet"),
+    label_col: str = typer.Option("label", help="Tên cột nhãn (1=malicious,0=benign)"),
+    positive_label: int = typer.Option(1, help="Giá trị nhãn positive"),
+):
+    """Đánh giá mô hình trên tập dữ liệu có nhãn (TPR/FPR/Precision/Recall/F1)."""
     try:
-        from models.lstm_anomaly import train_lstm_model
-        out = train_lstm_model()
-        typer.echo(f"[train-lstm] Wrote: {out}")
+        from models.evaluate import evaluate_model
+        report_path = evaluate_model(
+            labels_path=labels_path,
+            scores_path=scores_path,
+            label_col=label_col,
+            positive_label=positive_label,
+        )
+        typer.echo(f"[evaluate] Report: {report_path}")
     except ImportError as e:
-        logger.error(f"Không thể import models.lstm_anomaly: {e}")
+        logger.error(f"Không thể import models.evaluate: {e}")
         raise typer.Exit(code=1)
     except Exception as e:
-        logger.error(f"Lỗi khi train LSTM: {e}")
-        raise typer.Exit(code=1)
-
-@app.command("score-lstm")
-def cmd_score_lstm(reset: bool = typer.Option(False, help="Remove LSTM scores before scoring")):
-    """Chấm điểm bất thường bằng LSTM model."""
-    if reset:
-        _reset_dirs("data/scores_lstm", "data/scores/ensemble")
-    try:
-        from models.lstm_infer import score_lstm_features
-        out = score_lstm_features()
-        typer.echo(f"[score-lstm] Wrote: {out}")
-    except ImportError as e:
-        logger.error(f"Không thể import models.lstm_infer: {e}")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        logger.error(f"Lỗi khi score LSTM: {e}")
-        raise typer.Exit(code=1)
-
-@app.command("ensemble")
-def cmd_ensemble(reset: bool = typer.Option(False, help="Remove ensemble scores before combining")):
-    """Kết hợp điểm từ Isolation Forest và LSTM."""
-    if reset:
-        _reset_dirs("data/scores/ensemble")
-    try:
-        from models.ensemble import combine_if_lstm
-        out = combine_if_lstm()
-        typer.echo(f"[ensemble] Wrote: {out}")
-    except ImportError as e:
-        logger.error(f"Không thể import models.ensemble: {e}")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        logger.error(f"Lỗi khi ensemble: {e}")
+        logger.error(f"Lỗi khi evaluate: {e}")
         raise typer.Exit(code=1)
 
 @app.command("respond")
@@ -168,16 +177,6 @@ def cmd_demo(reset: bool = typer.Option(False, help="Reset ecs/features/scores/b
     cmd_featurize(reset=False)
     cmd_train()
     cmd_score(reset=False)
-
-@app.command("demo-lstm")
-def cmd_demo_lstm(reset: bool = typer.Option(False, help="Reset ecs/features/scores before run (LSTM path)")):
-    if reset:
-        _reset_dirs("data/ecs_parquet", "data/features", "data/scores", "data/bundles", "data/scores_lstm", "data/scores/ensemble")
-    cmd_ingest(reset=False)
-    cmd_featurize(reset=False)
-    cmd_train_lstm()
-    cmd_score_lstm(reset=False)
-    cmd_ensemble(reset=False)
 
 if __name__ == "__main__":
     app()
