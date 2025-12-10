@@ -125,8 +125,8 @@ def parse_fortigate(path: Optional[Path] = None, enable_udp: bool = False, udp_t
     paths = get_paths()
     out_dir = Path(paths["ecs_parquet_dir"])
     if path is None:
-        sample_root = Path("sample_data")
-        candidates = list(sample_root.glob("fortigate*.log")) + list(sample_root.glob("fortigate*.txt"))
+        sample_root = Path(paths.get("raw_data_dir", "sample_data"))
+        candidates = list(sample_root.glob("**/fortigate*.log")) + list(sample_root.glob("**/fortigate*.txt"))
         if candidates:
             path = candidates[0]
     if path:

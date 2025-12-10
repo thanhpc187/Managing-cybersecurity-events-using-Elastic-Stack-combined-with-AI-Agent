@@ -1,223 +1,203 @@
 ## 1) Executive Summary (Cập nhật)
 
-Dự án cung cấp pipeline phát hiện bất thường log an ninh mạng, từ ingest đa nguồn (Windows/Sysmon/Zeek/Syslog/FortiGate/IPS/Beats hoặc Elasticsearch), chuẩn hóa ECS, tạo đặc trưng mạng + đăng nhập, huấn luyện và chấm điểm Isolation Forest, chọn alert, giải thích SHAP, ánh xạ MITRE ATT&CK tự động, đóng gói forensic bundle, và hiển thị qua UI Streamlit. AI Agent (DeepSeek/Gemini/stub) phân tích, gợi ý hành động và ghi MITRE vào bundle/UI.
+Hệ thống phát hiện bất thường log an ninh mạng end-to-end, offline-first, hỗ trợ ingest đa nguồn (Windows/Sysmon/Zeek/Syslog/FortiGate/IPS/Packetbeat hoặc Elasticsearch), chuẩn hóa ECS, tạo đặc trưng mạng + đăng nhập, huấn luyện và chấm điểm Isolation Forest, ánh xạ MITRE ATT&CK tự động, giải thích SHAP, phân tích AI Agent (Gemini/DeepSeek/stub) và hiển thị trên Streamlit (kèm trang báo cáo một trang). Bundle pháp chứng là tùy chọn cho POC; pipeline chính vẫn chạy trơn trên files/Elastic mà không cần bundle.
 
 
 ## 2) Kiến trúc tổng quan
 
 ```
-Log Sources (files/UDP/Elasticsearch)
-    → Ingest + ECS Normalize (parsers/*, ecs_mapper)
-    → Parquet Store (data/ecs_parquet/…)
-    → Feature Engineering (features/*)
-    → Modeling (Isolation Forest)
-    → Scoring (scores.parquet)
-    → Alerting (threshold + top-N)
-    → Explainability (SHAP)
-    → MITRE Mapping (ai/mitre_mapper.py)
-    → Forensic Bundle (pipeline/bundle.py)
-    → UI/AI Analysis (Streamlit + AI Agent)
+Nguồn log (files/UDP/Elasticsearch)
+  → Ingest + ECS Normalize (parsers/*, ecs_mapper)
+  → Parquet Store (data/ecs_parquet/…)
+  → Feature Engineering (features/*)
+  → Modeling (Isolation Forest)
+  → Scoring (scores.parquet)
+  → Alerting (threshold + top-N)
+  → MITRE Mapping (ai/mitre_mapper.py)
+  → (Tùy chọn) Bundle pháp chứng
+  → UI/AI Analysis (Streamlit + AI Agent)
 ```
 
-- Config: `config/models.yaml`, `config/paths.yaml`, `config/ecs_mapping.yaml`, `config/mitre_mapping.yaml`.
+- Config: `config/models.yaml`, `paths.yaml`, `ecs_mapping.yaml`, `mitre_mapping.yaml`.
 - Alerting: ngưỡng quantile (1 - contamination), top-N.
-- Bundle: raw ±5m, features, SHAP, model_meta, AI+MITRE, manifest.
-- UI: timeline, drop/allow chart, IPS table, alert table + MITRE filters, bundle/AI viewer.
+- UI: timeline, drop/allow chart, IPS table, alert table + MITRE filters, trang báo cáo tổng hợp.
 
 
 ## 3) Cấu trúc thư mục & vai trò
 
-- `config/`: YAML cấu hình
-  - `paths.yaml`: đường dẫn data/models/scores/bundles, Elastic host/index patterns, cổng syslog FortiGate (5514)/IPS (514)/Beats (5044).
-  - `models.yaml`: hyperparams Isolation Forest, top_n, threshold_method.
-  - `ecs_mapping.yaml`: mapping raw → ECS cho Windows/Sysmon/Zeek/Syslog/FortiGate/IPS/Packetbeat.
-  - `policy.yaml`: SOAR actions (PowerShell).
-  - `mitre_mapping.yaml`: rule ánh xạ alert/feature → MITRE tactic/technique (T1110, T1021, T1046; hỗ trợ >, >=, <, <=, ==, string/list).
-
-- `parsers/`: Chuẩn hóa log → ECS
-  - `base_reader.py`: read JSONL, write partitioned Parquet.
-  - `ecs_mapper.py`: map dot-path theo config.
-  - `evtx_parser.py`, `sysmon_parser.py`, `zeek_parser.py`, `syslog_parser.py`, `csv_parser.py`, `log_parser.py`.
-  - `fortigate_parser.py`: syslog FortiGate (file/UDP 5514).
-  - `ips_parser.py`: Snort/Suricata (file/UDP 514).
-  - `beats_parser.py`: Packetbeat/Filebeat/Winlogbeat JSONL.
-
-- `features/`: Feature engineering
-  - `build_features.py`: hợp nhất ECS, flags login_failed/conn_suspicious/allow/deny/ips, entropy, sessionize, rolling counts 1/5/15m theo host/user/src/dst, uniq IP/port, rolling bytes/packets, deny_ratio, login_failed_ratio; xuất `features.parquet` + partition.
-  - `windowing.py`, `entropy.py`, `sessionize.py`, `scalers.py`.
-
-- `models/`: ML & đánh giá
-  - `train_if.py`: train Isolation Forest, lưu payload (model+scaler+feature_cols+meta).
-  - `infer.py`: score → `scores.parquet` (+ partition).
-  - `evaluate.py`: tính TPR/FPR/Precision/Recall/F1 (có nhãn).
-  - `utils.py`: get_paths, load config, sha256, write_json.
-
-- `explain/`: Explainability
-  - `shap_explain.py`: SHAP (Tree → Kernel → fallback).
-  - `thresholding.py`: ngưỡng quantile.
-
-- `ai/`: AI Agent & MITRE
-  - `agent.py`: LLM phân tích, tương quan đa nguồn, MITRE mapping, SOAR actions, markdown.
-  - `mitre_mapper.py`: load/cache mapping, áp rule MITRE (tactic/technique) dựa trên alert + features.
-
-- `pipeline/`: Orchestration
-  - `ingest.py`: ingest từ file/Elastic; optional UDP FortiGate/IPS; CSV/syslog auth.
-  - `build_store.py`: chạy toàn bộ parsers.
-  - `alerting.py`: chọn top alerts ≥ threshold.
-  - `bundle.py`: build bundle (raw, features, SHAP, model_meta, AI+MITRE, manifest, COC).
-  - `run_demo.py`: end-to-end demo.
-  - `respond.py`: SOAR actions (dry-run/apply).
-  - `coc.py`: chain of custody.
-
-- `ui/`: Streamlit
-  - `streamlit_app.py`: entry, status cards, nav.
-  - `pages/1_Overview.py`: timeline anomaly, lọc action/module, chart drop/allow, bảng IPS.
-  - `pages/2_Hosts.py`: view theo host.
-  - `pages/3_Alerts.py`: bảng alert, SHAP bar, context ±5m, bundle download, AI analysis, cột & lọc MITRE.
-  - `disabled_pages/`: LSTM/SOAR cũ (tắt).
-
-- `cli/`: Typer CLI
-  - `anom_score.py`: `ingest` (files/Elastic/UDP), `featurize`, `train`, `score`, `bundle`, `evaluate`, `respond`, `demo`.
-
-- `tests/`: Kiểm thử
-  - `test_mitre_mapper.py`: unit test MITRE mapper.
-
-- `split_log/`: Tiện ích chia log theo ngày/keyword/range.
-
-- `README.md`: Hướng dẫn chạy, MITRE mapping, ingest Elastic, evaluate.
-- `PROJECT_TECH_REVIEW.md`: (file này) mô tả kỹ thuật chi tiết.
+- `config/`: cấu hình đường dẫn, mô hình, ECS mapping, MITRE rule, SOAR policy.
+- `parsers/`: chuẩn hóa log đa nguồn (Windows, Sysmon, Zeek, Syslog auth, CSV, FortiGate, IPS, Packetbeat).
+- `features/`: đặc trưng mạng + đăng nhập (flags, entropy, session, rolling counts/uniq/bytes/ratios).
+- `models/`: train/score Isolation Forest, evaluate; utils path/hash/json.
+- `explain/`: ngưỡng quantile, SHAP (Tree→Kernel→fallback).
+- `ai/`: MITRE mapper, AI Agent (Gemini/DeepSeek/stub) + threat.*.
+- `pipeline/`: ingest, alerting, (tùy chọn) bundle, respond SOAR, demo end-to-end.
+- `ui/`: Streamlit (trang chính + báo cáo tổng hợp 4_Report).
+- `cli/`: Typer CLI (ingest/featurize/train/score/evaluate/respond/demo/bundle).
+- `tests/`: test_mitre_mapper.
+- `sample_data/`: dữ liệu giả (normal, attack) + script generate.
+- `split_log/`: tiện ích chia log.
 
 
-## 4) Mỗi file làm gì (bản đầy đủ, cập nhật)
+## 4) Mỗi file làm gì (bản đầy đủ)
 
-| Path | API/CLI | Chức năng chính | Ghi chú |
-| --- | --- | --- | --- |
-| `config/paths.yaml` | n/a | Đường dẫn data/models/scores/bundles; Elastic host/index patterns; cổng syslog/beats | Dùng `models/utils.get_paths` để resolve |
-| `config/models.yaml` | n/a | Hyperparams IF; scaling; scoring top_n/threshold_method | contamination ảnh hưởng ngưỡng quantile |
-| `config/ecs_mapping.yaml` | n/a | Mapping raw→ECS cho Windows/Sysmon/Zeek/Syslog/FortiGate/IPS/Packetbeat | Định nghĩa timestamp & map dot-path |
-| `config/policy.yaml` | n/a | SOAR PowerShell actions theo ngưỡng | Dùng trong respond |
-| `config/mitre_mapping.yaml` | n/a | Rule MITRE (T1110/T1021/T1046…) với điều kiện số/chuỗi/list | Có thể thêm rule mới không cần sửa code |
-| `parsers/base_reader.py` | `read_jsonl`, `write_partitioned_parquet` | Đọc JSONL, ghi Parquet theo dt | Bỏ dòng hỏng để demo bền |
-| `parsers/ecs_mapper.py` | `map_record` | Map dict lồng nhau sang ECS | Ưu tiên timestamp cấu hình |
-| `parsers/evtx_parser.py` | `parse_evtx` | Windows EVTX JSONL → ECS | Gán event.module/dataset |
-| `parsers/sysmon_parser.py` | `parse_sysmon` | Sysmon JSONL → ECS | Trường network/process |
-| `parsers/zeek_parser.py` | `parse_zeek_conn` | Zeek conn → ECS | conn_state → event.outcome |
-| `parsers/syslog_parser.py` | `parse_auth_log` | Syslog auth → ECS (regex) | Infer Success/Failure |
-| `parsers/log_parser.py` | `parse_auth_logs` | Đọc .log syslog (recursive) | |
-| `parsers/csv_parser.py` | `parse_csv_file` | CSV generic → ECS | Dùng `CSV_TIME_COL` env nếu khác tên |
-| `parsers/fortigate_parser.py` | `parse_fortigate` | FortiGate syslog (file/UDP 5514) → ECS | KV parser, ghép timestamp date+time |
-| `parsers/ips_parser.py` | `parse_ips` | Snort/Suricata (file/UDP 514) → ECS | Regex classification/priority/proto/src/dst |
-| `parsers/beats_parser.py` | `parse_beats` | Packetbeat/Filebeat/Winlogbeat JSONL → ECS | Ưu tiên mapping packetbeat |
-| `features/build_features.py` | `build_feature_table` | Hợp nhất ECS; flags login_failed/conn_suspicious/allow/deny/ips; entropy; sessionize; rolling counts 1/5/15m; uniq IP/port; bytes/packets; deny_ratio; login_failed_ratio; xuất features | Partition per-day, sample |
-| `features/windowing.py` | `add_time_window_counts` | Rolling sum cờ nhị phân | on @timestamp, min_periods=1 |
-| `features/entropy.py` | `shannon_entropy` | Entropy chuỗi | |
-| `features/sessionize.py` | `sessionize_network` | Session 5-tuple + timeout | |
-| `features/scalers.py` | helper | Scaler utils | |
-| `models/train_if.py` | `train_model` | Train IF, RobustScaler, drop constant cols, lưu payload | out: isolation_forest.joblib |
-| `models/infer.py` | `score_features` | Score features (partition-aware) → scores.parquet | anom.score = -decision_function |
-| `models/evaluate.py` | `evaluate_model` | Đọc scores + nhãn → TPR/FPR/Precision/Recall/F1 | Output `evaluate_report.json` |
-| `models/utils.py` | `get_paths`, `load_models_config`, `write_json`, `sha256_file` | Resolve path, IO | Hỗ trợ list/URL/số |
-| `explain/thresholding.py` | `compute_threshold` | Quantile (1 - contamination) | |
-| `explain/shap_explain.py` | `top_shap_for_rows` | SHAP Tree → Kernel → fallback ranking | Tắt JIT để tránh lỗi numba |
-| `ai/mitre_mapper.py` | `load_mitre_mapping`, `map_to_mitre` | Ánh xạ MITRE từ alert+features theo YAML rule | Cache mapping |
-| `ai/agent.py` | `analyze_alert_with_llm`, `analyze_alert` | Prompt LLM, risk, actions, correlations, MITRE auto, threat.*; markdown | Provider DeepSeek→Gemini→stub |
-| `pipeline/ingest.py` | `ingest_all`, `ingest_from_elastic` | Ingest file/Elastic; optional UDP FortiGate/IPS; CSV/syslog auth | |
-| `pipeline/build_store.py` | `run_ingest` | Chạy tất cả parsers | |
-| `pipeline/alerting.py` | `select_alerts` | Chọn top-N ≥ threshold | |
-| `pipeline/bundle.py` | `build_bundle_for_alert`, `build_bundles_for_top_alerts` | Bundle raw/context ±5m, features, SHAP, model_meta, AI+MITRE, manifest, COC | manifest chứa threshold/score |
-| `pipeline/run_demo.py` | `run_all` | ingest→features→train→score→alerts→bundles | |
-| `pipeline/respond.py` | `respond` | SOAR PowerShell (dry-run/apply) | |
-| `pipeline/coc.py` | `build_coc` | Chain-of-custody | |
-| `cli/anom_score.py` | Typer commands | ingest (files/Elastic/UDP), featurize, train, score, bundle, evaluate, respond, demo | Đã bỏ lệnh LSTM/ensemble |
-| `ui/streamlit_app.py` | n/a | Status cards, nav | |
-| `ui/pages/1_Overview.py` | n/a | Timeline anomaly, lọc action/module, chart drop/allow, bảng IPS | |
-| `ui/pages/2_Hosts.py` | n/a | View theo host | |
-| `ui/pages/3_Alerts.py` | n/a | Bảng alert + lọc action/module + lọc MITRE, SHAP, context, bundle, AI | |
-| `tests/test_mitre_mapper.py` | unittest | Kiểm thử map_to_mitre | |
+| Path | Chức năng | Ghi chú |
+|---|---|---|
+| `config/paths.yaml` | Đường dẫn data/models/scores/bundles; Elastic host/index patterns; cổng syslog/beats | Dùng `models/utils.get_paths`; hỗ trợ override env |
+| `config/models.yaml` | Hyperparams IF, scaling, scoring top_n/threshold | contamination ảnh hưởng ngưỡng quantile |
+| `config/ecs_mapping.yaml` | Mapping raw→ECS Windows/Sysmon/Zeek/Syslog/FortiGate/IPS/Packetbeat | Định nghĩa timestamp & dot-path |
+| `config/policy.yaml` | SOAR PowerShell actions | Dùng trong respond |
+| `config/mitre_mapping.yaml` | Rule MITRE (T1110/T1021/T1046…), so sánh số/chuỗi/list | Nới lỏng: T1110 (count>7, ratio>0.4), T1046 (uniq_dport>8), T1021 (port 22/3389/445 + allow) |
+| `parsers/base_reader.py` | Đọc JSONL, ghi Parquet dt=YYYY-MM-DD | Bỏ dòng hỏng |
+| `parsers/ecs_mapper.py` | Map dict lồng nhau sang ECS | Ưu tiên timestamp cấu hình |
+| `evtx_parser.py`, `sysmon_parser.py`, `zeek_parser.py`, `syslog_parser.py`, `csv_parser.py`, `log_parser.py` | Parser nguồn tương ứng | |
+| `fortigate_parser.py` | FortiGate syslog (file/UDP) → ECS | KV parser |
+| `ips_parser.py` | Snort/Suricata (file/UDP) → ECS | Regex classification/priority/proto/src/dst |
+| `beats_parser.py` | Packetbeat/Filebeat/Winlogbeat JSONL → ECS | |
+| `features/build_features.py` | Hợp nhất ECS; flags login_failed/conn_suspicious/allow/deny/ips; entropy; sessionize; rolling 1/5/15m theo host/user/src/dst; uniq IP/port; bytes/packets; deny_ratio; login_failed_ratio; xuất features | Partition per-day |
+| `features/windowing.py`, `entropy.py`, `sessionize.py`, `scalers.py` | Tiện ích rolling/entropy/session/scaler | |
+| `models/train_if.py` | Train IF + RobustScaler, drop constant cols | out: `data/models/isolation_forest.joblib` |
+| `models/infer.py` | Score features (partition-aware) → `scores.parquet` | anom.score = -decision_function |
+| `models/evaluate.py` | Tính TPR/FPR/Precision/Recall/F1 (nếu có nhãn) | out: `evaluate_report.json` |
+| `models/utils.py` | get_paths, load config, write_json, sha256 | Hỗ trợ list/URL/số |
+| `explain/thresholding.py` | Quantile threshold | |
+| `explain/shap_explain.py` | SHAP Tree→Kernel→fallback ranking | |
+| `ai/mitre_mapper.py` | Load/cache mapping, map_to_mitre(alert, features) | |
+| `ai/agent.py` | LLM phân tích, risk, actions, correlations, MITRE auto, threat.*; markdown | Provider: DeepSeek→Gemini→stub |
+| `pipeline/ingest.py` | ingest files/Elastic; optional UDP FortiGate/IPS; CSV/syslog auth | |
+| `pipeline/build_store.py` | Chạy tất cả parsers | |
+| `pipeline/alerting.py` | Chọn top-N ≥ threshold | |
+| `pipeline/bundle.py` | (Tùy chọn) bundle raw/features/SHAP/AI/MITRE/manifest | POC có thể bỏ qua |
+| `pipeline/run_demo.py` | ingest→features→train→score→alerts→bundles | |
+| `pipeline/respond.py` | SOAR PowerShell (dry-run/apply) | |
+| `pipeline/coc.py` | Chain-of-custody | |
+| `cli/anom_score.py` | Typer CLI ingest/featurize/train/score/bundle/evaluate/respond/demo | |
+| `ui/streamlit_app.py` | Trang chính + link báo cáo | |
+| `ui/pages/1_Overview.py` | Timeline, metrics, drop/allow chart, IPS table | |
+| `ui/pages/3_Alerts.py` | Bảng alert, SHAP bar, context ±5m, AI analysis, MITRE filters | |
+| `ui/pages/4_Report.py` | Báo cáo một trang: tổng quan, metrics, risk, anom.score hist, MITRE, SHAP tổng hợp, AI markdown (nếu có), timeline alert, bảng chi tiết | |
+| `tests/test_mitre_mapper.py` | Unit test MITRE | |
 
 
-## 5) Pipeline end-to-end (cập nhật)
+## 5) Pipeline end-to-end (khuyến nghị, không bundle)
 
-- Ingest: file/Elastic/UDP → `data/ecs_parquet/{source}/dt=.../part.parquet`.
-- Features: hợp nhất, tính flags/rolling/uniq/bytes/ratios → `data/features/features.parquet` (+ partitions).
-- Train: IF → `data/models/isolation_forest.joblib`.
-- Score: → `data/scores/scores.parquet` (+ partitions).
-- Alerting: threshold quantile (1-contamination), lấy top-N.
-- Explain + MITRE: SHAP + map_to_mitre (config/mitre_mapping.yaml).
-- Bundle: raw ±5m, features, shap, model_meta, ai_analysis (kèm MITRE), manifest, COC.
-- UI: đọc scores/alerts/bundles; hiển thị MITRE, SHAP, context; tải bundle.
-
-
-## 6) Dữ liệu & ECS (mở rộng nguồn)
-
-- Nguồn log: Windows EVTX, Sysmon, Zeek conn, Syslog auth, FortiGate syslog, IPS (Snort/Suricata), Packetbeat/Filebeat/Winlogbeat; hoặc truy vấn trực tiếp Elasticsearch (index patterns cấu hình).
-- Trường ECS chính: `@timestamp`, host/user, source/destination (ip/port), network.transport/protocol, event.action/outcome/severity, process.*, rule.*, network.bytes/packets.
-
-
-## 7) Features (mở rộng mạng)
-
-- Flags: login_failed, conn_suspicious, action_allow/deny, ips_alert.
-- Rolling counts 1/5/15m theo host/user/src/dst.
-- Uniq IP/port theo cửa sổ; rolling bytes/packets; deny_ratio; login_failed_ratio.
-- Entropy: command_line/message; sessionize 5-tuple.
-
-
-## 8) Modeling
-
-- Isolation Forest (duy nhất, không còn LSTM/ensemble), RobustScaler, loại constant cols.
-- Scoring: anom.score = -decision_function.
-- Evaluate: tính TPR/FPR/Precision/Recall/F1 qua `models/evaluate.py`.
-
-
-## 9) Explainability & AI/LLM
-
-- SHAP top features (fallback Kernel/ranking).
-- AI Agent: LLM tiếng Việt (DeepSeek→Gemini→stub), tương quan đa nguồn, gợi ý SOAR, markdown, MITRE auto mapping (threat.* + mitre_attack payload).
+1) Sinh dữ liệu giả:
+```
+python sample_data/generate_synthetic_logs.py
+```
+2) Train trên normal:
+```
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/normal
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score train
+```
+3) Score trên attack:
+```
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/attack
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score score --reset
+```
+4) (Tùy chọn) bundle & SHAP/AI markdown:
+```
+python -m cli.anom_score bundle
+```
+5) (Tùy chọn) evaluate nếu có nhãn:
+```
+python -m cli.anom_score evaluate --labels-path <file_labels> --label-col label
+```
+6) UI:
+```
+streamlit run ui/streamlit_app.py   # trang Báo cáo tổng hợp (4_Report) hiển thị alerts, MITRE, risk, timeline, SHAP, metrics
+```
 
 
-## 10) Forensic Bundle
+## 6) Dữ liệu & ECS
 
-- Gồm: raw_logs.jsonl (±5m), features.json, shap_explanation.json, model_meta.json, ai_analysis.json/md (có MITRE), evidence_manifest, manifest (sha256, threshold, alert_score), coc.
-
-
-## 11) CLI & UI (hiển thị MITRE)
-
-- CLI: thêm `evaluate`; ingest hỗ trợ Elastic/UDP; bỏ lệnh LSTM/ensemble.
-- UI Alerts: cột + bộ lọc MITRE tactics/techniques, lọc action/module, đồ thị drop/allow, SHAP bar, context ±5m, bundle download, AI analysis.
+- Nguồn: Windows EVTX, Sysmon, Zeek conn, Syslog auth, FortiGate syslog, IPS (Snort/Suricata), Packetbeat; hoặc Elasticsearch index patterns.
+- Trường ECS chính: `@timestamp`, host/user, source/destination ip/port, network.transport/protocol, event.action/outcome/severity, process.*, rule.*, network.bytes/packets.
+- Synthetic data (normal/attack) sinh từ `sample_data/generate_synthetic_logs.py`.
 
 
-## 12) Cấu hình & phụ thuộc (cập nhật)
+## 7) Features (mạng + đăng nhập)
 
-- `config/mitre_mapping.yaml` mới; `requirements.txt` bỏ tensorflow/keras, thêm `requests`.
-- `models/utils.get_paths` hỗ trợ list/URL/số (cho index patterns).
-
-
-## 13) Kiểm thử
-
-- Đã thêm `tests/test_mitre_mapper.py` (unit test MITRE). Các test khác chưa có; khuyến nghị bổ sung E2E + unit cho parsers/features/thresholding.
+- Flags: login_failed, conn_suspicious, action_allow/deny, ips_alert, cbs_failed.
+- Rolling counts 1/5/15m theo host/user/src/dst (cbs_failed thêm process.name).
+- Unique IP/port (uniq_dst_per_src, uniq_src_per_dst, uniq_dport_per_src).
+- Rolling bytes/packets theo host/src/dst; ratios: deny_ratio_{w}m, login_failed_ratio_{w}m.
+- Entropy: command_line, message; fallback text_entropy; sessionize 5-tuple.
 
 
-## 14) Rủi ro & đề xuất (rút gọn hiện tại)
+## 8) MITRE ATT&CK mapping (đang áp dụng)
 
-- Rủi ro: dữ liệu demo nhỏ; SHAP có thể lỗi môi trường; thiếu logging/metrics; chưa có test đầy đủ.
-- Đề xuất: thêm logging chuẩn; validate schema/time; test E2E + unit; per-source threshold; UI search/pagination/heatmap; caching SHAP; mở rộng parser DNS/HTTP/TLS.
-
-
-## 15) Gap Analysis (điểm mới)
-
-- Chuẩn hóa ECS đa nguồn: đã mở rộng FortiGate/IPS/Beats/Elastic.
-- Features: đã thêm ratio/uniq/bytes; vẫn có thể bổ sung duration/session bytes.
-- Explainability/Bundle: đã thêm MITRE vào AI/bundle/manifest; có thể thêm timeline.json.
-- CLI/UI: đã thêm MITRE filter/cột; còn thiếu search nâng cao/pagination.
+- `config/mitre_mapping.yaml` (đã nới lỏng):
+  - T1110 Brute Force: login_failed_count_5m > 7, login_failed_ratio_5m > 0.4.
+  - T1046 Network Service Discovery: uniq_dport_per_src_1m > 8, conn_suspicious == 1.
+  - T1021 Remote Services: destination.port ∈ {22, 3389, 445}, event.action == "allow".
+- `ai/mitre_mapper.py` đọc YAML, match điều kiện (AND), không match nếu field None; đã cache để tránh đọc lại nhiều lần.
+- Trang báo cáo và Alerts đều tính/hiển thị MITRE (recompute trên alert nếu thiếu).
 
 
-## 16) Runbook nhanh
+## 9) Modeling
 
-- Tạo venv, cài deps: `pip install -r requirements.txt`
-- Ingest Elastic: `python -m cli.anom_score ingest --source elasticsearch --elastic-host http://10.10.20.100:9200 --elastic-index-patterns "lab-logs-network-syslog-*,siem-*"`
-- Hoặc ingest file/UDP demo: `python -m cli.anom_score ingest --enable-udp`
-- Featurize + train + score: `python -m cli.anom_score featurize && python -m cli.anom_score train && python -m cli.anom_score score`
-- Evaluate: `python -m cli.anom_score evaluate --labels-path <path_labels>`
-- Streamlit: `streamlit run ui/streamlit_app.py`
-- Làm sạch: xóa `data/` và `bundles/` nếu cần.
+- Isolation Forest (duy nhất), RobustScaler, loại constant cols.
+- anom.score = -decision_function.
+- Evaluate (tùy chọn) với nhãn: TPR/FPR/Precision/Recall/F1.
 
+
+## 10) Explainability & AI/LLM
+
+- SHAP top features (Tree → Kernel → fallback ranking).
+- AI Agent: ưu tiên Gemini (GEMINI_API_KEY); fallback DeepSeek (DEEPSEEK_API_KEY); cuối cùng stub offline. Điền threat.* nếu có MITRE; trả về risk_level, actions (PowerShell/SOAR), correlations, markdown.
+
+
+## 11) UI Streamlit
+
+- `streamlit_app.py`: status, link trang Báo cáo tổng hợp.
+- `pages/4_Report.py`: báo cáo một trang (tổng quan, metrics, risk, anom hist, MITRE chart, SHAP tổng hợp từ bundle nếu có, AI markdown nếu có, timeline alert, bảng chi tiết có lọc).
+- `pages/1_Overview.py`: timeline anomaly, drop/allow, IPS table.
+- `pages/3_Alerts.py`: bảng alert + lọc MITRE, SHAP bar, context ±5m, AI analysis (bundle nếu có).
+
+
+## 12) Cấu hình & phụ thuộc
+
+- `requirements.txt`: numpy, pandas, pyarrow, fastparquet, scikit-learn, shap, typer/click, streamlit, google-generativeai (Gemini), requests, python-dotenv.
+- Không còn tensorflow/keras (LSTM đã bỏ).
+
+
+## 13) Kiểm thử & chất lượng
+
+- Có `tests/test_mitre_mapper.py`. Chưa có E2E/parsings/feature tests; khuyến nghị bổ sung.
+- Synthetic data + pipeline rút gọn giúp kiểm thử nhanh.
+
+
+## 14) Rủi ro & đề xuất
+
+- Rủi ro: dataset nhỏ; SHAP có thể lỗi môi trường; thiếu logging/metrics; thiếu test E2E; MITRE phụ thuộc đầy đủ field/feature.
+- Đề xuất: thêm logging chuẩn; validate schema/time; thêm test E2E; per-source threshold; UI search/pagination/heatmap; caching SHAP; parser DNS/HTTP/TLS.
+
+
+## 15) Runbook nhanh (không bundle)
+
+```
+python -m venv venv; venv\Scripts\activate
+pip install -r requirements.txt
+python sample_data/generate_synthetic_logs.py
+
+# Train trên normal
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/normal
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score train
+
+# Score trên attack
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/attack
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score score --reset
+
+# (tùy chọn) bundle + SHAP/AI markdown
+python -m cli.anom_score bundle
+
+# (tùy chọn) evaluate nếu có nhãn
+python -m cli.anom_score evaluate --labels-path <file_labels> --label-col label
+
+streamlit run ui/streamlit_app.py  # xem báo cáo tổng hợp
+```

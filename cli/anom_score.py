@@ -22,6 +22,7 @@ def _safe_run_ingest(
     elastic_user: Optional[str] = None,
     elastic_password: Optional[str] = None,
     enable_udp: bool = False,
+    data_dir: Optional[str] = None,
 ):
     """Chạy ingest với fallback nếu module không khả dụng."""
     try:
@@ -33,6 +34,7 @@ def _safe_run_ingest(
             elastic_user=elastic_user,
             elastic_password=elastic_password,
             enable_udp=enable_udp,
+            data_dir=data_dir,
         )
     except ImportError as e:
         logger.warning(f"Không thể import pipeline.ingest: {e}, thử fallback")
@@ -68,6 +70,7 @@ def cmd_ingest(
     elastic_user: str = typer.Option(None, help="Elastic username"),
     elastic_password: str = typer.Option(None, help="Elastic password"),
     enable_udp: bool = typer.Option(False, help="Bật listener UDP demo cho FortiGate/IPS"),
+    data_dir: str = typer.Option(None, help="Thư mục log nguồn (vd sample_data/normal hoặc sample_data/attack)"),
 ):
     if reset:
         _reset_dirs("data/ecs_parquet")
@@ -79,6 +82,7 @@ def cmd_ingest(
         elastic_user=elastic_user,
         elastic_password=elastic_password,
         enable_udp=enable_udp,
+        data_dir=data_dir,
     )
     typer.echo("[ingest] Done.")
 
@@ -129,6 +133,28 @@ def cmd_score(reset: bool = typer.Option(False, help="Remove scores before scori
         raise typer.Exit(code=1)
     except Exception as e:
         logger.error(f"Lỗi khi score: {e}")
+        raise typer.Exit(code=1)
+
+@app.command("bundle")
+def cmd_bundle():
+    """Tạo forensic bundle cho top alerts (dựa trên scores.parquet)."""
+    try:
+        from models.utils import get_paths
+        from pipeline.alerting import select_alerts
+        from pipeline.bundle import build_bundles_for_top_alerts
+        paths = get_paths()
+        scores_path = Path(paths["scores_dir"]) / "scores.parquet"
+        if not scores_path.exists():
+            typer.echo(f"[bundle] Không tìm thấy {scores_path}, hãy chạy score trước.")
+            raise typer.Exit(code=1)
+        top, thr = select_alerts(str(scores_path))
+        build_bundles_for_top_alerts(top, thr)
+        typer.echo(f"[bundle] Done. Bundles in {paths['bundles_dir']}")
+    except ImportError as e:
+        logger.error(f"Không thể import bundle pipeline: {e}")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo bundle: {e}")
         raise typer.Exit(code=1)
 
 @app.command("evaluate")

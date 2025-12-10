@@ -39,8 +39,9 @@ def parse_beats(path: Optional[Path] = None) -> Optional[Path]:
     - path None: tìm sample_data/packetbeat*.jsonl hoặc sample_data/beats/*.jsonl
     """
     if path is None:
-        sample_root = Path("sample_data")
-        candidates = list(sample_root.glob("packetbeat*.jsonl")) + list((sample_root / "beats").glob("*.jsonl"))
+        from models.utils import get_paths
+        sample_root = Path(get_paths().get("raw_data_dir", "sample_data"))
+        candidates = list(sample_root.glob("**/packetbeat*.jsonl")) + list((sample_root / "beats").glob("*.jsonl"))
         if candidates:
             path = candidates[0]
     if path is None:

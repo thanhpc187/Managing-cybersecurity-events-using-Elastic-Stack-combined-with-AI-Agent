@@ -1,11 +1,9 @@
-# ui/streamlit_app.py
-# -*- coding: utf-8 -*-
-
-import os
 import sys
-from datetime import datetime
+import os
+import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
@@ -15,176 +13,276 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.utils import get_paths  # noqa: E402
+from explain.thresholding import compute_threshold  # noqa: E402
+from ai.mitre_mapper import load_mitre_mapping, map_to_mitre  # noqa: E402
+
+
+st.set_page_config(page_title="Báo cáo kết quả", layout="wide", page_icon="📊")
+st.title("📊 Báo cáo kết quả SIEM + AI Agent (One-page)")
+
 
 # ---------------------------------------------------------
-# Page config + minimal CSS
+# Load data
 # ---------------------------------------------------------
-st.set_page_config(page_title="Loganom AI", layout="wide", page_icon="🛡️")
+paths = get_paths()
+scores_path = Path(paths["scores_dir"]) / "scores.parquet"
+eval_report_path = Path(paths["scores_dir"]) / "evaluate_report.json"
 
-st.markdown(
-    """
-    <style>
-    .pill {
-        display:inline-block;padding:4px 10px;border-radius:999px;
-        font-weight:600;font-size:0.85rem;color:white
-    }
-    .pill-ok { background:#10b981; }      /* emerald */
-    .pill-warn { background:#f59e0b; }    /* amber  */
-    .pill-bad { background:#ef4444; }     /* red    */
-    .dim { color:#6b7280; }               /* gray-500 */
-    .shadow { box-shadow: 0 1px 12px rgba(0,0,0,.06); border-radius:12px; padding:16px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+if not scores_path.exists():
+    st.warning("Chưa có dữ liệu scores. Hãy chạy ingest → featurize → train → score trước.")
+    st.stop()
+
+df = pd.read_parquet(scores_path)
+if "@timestamp" in df.columns:
+    df["@timestamp"] = pd.to_datetime(df["@timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["@timestamp"]).sort_values("@timestamp")
+
+# Threshold & alerts
+thr, _ = compute_threshold(df["anom.score"]) if "anom.score" in df.columns and len(df) else (None, 0)
+alerts = df[df["anom.score"] >= thr].copy() if thr is not None else df.head(0)
+
+# Recompute MITRE mapping
+mapping_cfg = load_mitre_mapping()
+if mapping_cfg is not None:
+    mitre_tactics = []
+    mitre_techs = []
+    for _, r in alerts.iterrows():
+        hits = map_to_mitre(r.to_dict(), r.to_dict(), mapping_cfg)
+        tactics = sorted({h.get("tactic") for h in hits if h.get("tactic")})
+        techs = sorted({h.get("technique") for h in hits if h.get("technique")})
+        mitre_tactics.append(", ".join(tactics))
+        mitre_techs.append(", ".join(techs))
+    alerts["mitre.tactics"] = mitre_tactics
+    alerts["mitre.techniques"] = mitre_techs
+else:
+    alerts["mitre.tactics"] = ""
+    alerts["mitre.techniques"] = ""
+
+# Risk level fallback
+if "risk_level" not in alerts.columns:
+    alerts["risk_level"] = None
+alerts["risk_level"] = alerts["risk_level"].fillna("")
+
+
+def _fallback_risk(row):
+    if row.get("risk_level"):
+        return row["risk_level"]
+    tech = str(row.get("mitre.techniques", "")).strip()
+    return "MEDIUM" if tech else "LOW"
+
+
+alerts["risk_level"] = alerts.apply(_fallback_risk, axis=1)
+
 
 # ---------------------------------------------------------
-# Helpers
+# MITRE helpers: link + Gemini explanation
 # ---------------------------------------------------------
-def _get_secret(name: str) -> str | None:
-    """Prefer environment variables; only read st.secrets if secrets.toml exists."""
-    # 1) Env var first (no warnings)
-    env_val = os.getenv(name)
-    if env_val:
-        return env_val
+def _technique_url(tech_id: str) -> str:
+    """Build MITRE ATT&CK URL from technique id (supports sub-techniques)."""
+    tid = (tech_id or "").strip()
+    if not tid:
+        return ""
+    return f"https://attack.mitre.org/techniques/{tid.replace('.', '/')}/"
 
-    # 2) Only touch st.secrets if a secrets.toml is present
-    candidates = [
-        PROJECT_ROOT / ".streamlit" / "secrets.toml",
-        Path.home() / ".streamlit" / "secrets.toml",
-    ]
-    if any(p.exists() for p in candidates):
-        try:
-            val = st.secrets.get(name)
-            if val:
-                return str(val)
-        except Exception:
-            pass
-    return None
+
+def _collect_mitre_techniques(alerts_df: pd.DataFrame):
+    """Extract unique techniques from alerts dataframe."""
+    seen = set()
+    items = []
+    if alerts_df is None or alerts_df.empty:
+        return items
+    tech_series = alerts_df.get("mitre.techniques")
+    if tech_series is None:
+        return items
+    for raw in tech_series.fillna(""):
+        for part in str(raw).split(","):
+            t = part.strip()
+            if not t:
+                continue
+            tid = t.split()[0] if " " in t else t
+            name = t[len(tid):].strip()
+            key = tid.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"id": tid, "name": name})
+    return items
 
 
 @st.cache_data(show_spinner=False)
-def _scan_status(paths: dict):
-    scores_dir = Path(paths.get("scores_dir", "")) if paths else None
-    bundles_dir = Path(paths.get("bundles_dir", "")) if paths else None
-    models_dir = Path(paths.get("models_dir", "")) if paths else None
-
-    parquet_files = []
-    latest_file = None
-    latest_ts = None
-
-    if scores_dir and scores_dir.exists():
-        parquet_files = list(scores_dir.rglob("*.parquet"))
-        if parquet_files:
-            latest_file = max(parquet_files, key=lambda p: p.stat().st_mtime)
-            latest_ts = datetime.fromtimestamp(latest_file.stat().st_mtime)
-
-    model_path = None
-    if models_dir and models_dir.exists():
-        # ưu tiên file IF mặc định nếu có
-        candidate = models_dir / "isolation_forest.joblib"
-        model_path = candidate if candidate.exists() else None
-
-    bundle_count = 0
-    if bundles_dir and bundles_dir.exists():
-        bundle_count = len(list(bundles_dir.glob("alert_*.zip")))
-
-    llm_ok = bool(_get_secret("DEEPSEEK_API_KEY") or _get_secret("GEMINI_API_KEY"))
-
-    return {
-        "scores_dir": scores_dir,
-        "scores_count": len(parquet_files),
-        "latest_file": latest_file,
-        "latest_ts": latest_ts,
-        "models_dir": models_dir,
-        "model_path": model_path,
-        "bundles_dir": bundles_dir,
-        "bundle_count": bundle_count,
-        "llm_ok": llm_ok,
-    }
-
-
-def _pill(text: str, kind: str = "ok") -> str:
-    cls = {"ok": "pill-ok", "warn": "pill-warn", "bad": "pill-bad"}.get(kind, "pill-ok")
-    return f'<span class="pill {cls}">{text}</span>'
-
-
-# ---------------------------------------------------------
-# Hero header
-# ---------------------------------------------------------
-st.markdown("### 🛡️ Loganom AI")
-st.caption("Logs → ECS → Features → Isolation Forest Scoring → Alerts/SHAP → Bundle → (LLM)")
-
-# Quick navigation
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    st.page_link("pages/1_Overview.py", label="Overview", icon="📊")
-with c2:
-    st.page_link("pages/2_Hosts.py", label="Hosts", icon="🖥️")
-with c3:
-    st.page_link("pages/3_Alerts.py", label="Alerts", icon="⚠️")
-
-st.divider()
-
-# ---------------------------------------------------------
-# Status cards
-# ---------------------------------------------------------
-paths = get_paths()
-status = _scan_status(paths)
-
-m1, m2, m3, m4 = st.columns(4)
-
-with m1:
-    st.markdown('<div class="shadow">', unsafe_allow_html=True)
-    st.metric("Scores files", status["scores_count"])
-    if status["latest_ts"]:
-        st.caption(f"Latest: {status['latest_file'].name} ({status['latest_ts']:%Y-%m-%d %H:%M:%S})")
-    else:
-        st.caption("Chưa có file .parquet")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with m2:
-    st.markdown('<div class="shadow">', unsafe_allow_html=True)
-    if status["model_path"]:
-        st.markdown(_pill("Model: Ready", "ok"), unsafe_allow_html=True)
-        st.caption(str(status["model_path"]))
-    else:
-        st.markdown(_pill("Model: Missing", "bad"), unsafe_allow_html=True)
-        st.caption("models/isolation_forest.joblib")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with m3:
-    st.markdown('<div class="shadow">', unsafe_allow_html=True)
-    if status["llm_ok"]:
-        st.markdown(_pill("LLM: Configured", "ok"), unsafe_allow_html=True)
-        st.caption("Đã thấy DEEPSEEK_API_KEY hoặc GEMINI_API_KEY")
-    else:
-        st.markdown(_pill("LLM: Offline", "warn"), unsafe_allow_html=True)
-        st.caption("Thiếu DEEPSEEK_API_KEY / GEMINI_API_KEY")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with m4:
-    st.markdown('<div class="shadow">', unsafe_allow_html=True)
-    st.metric("Bundles", status["bundle_count"])
-    if status["bundles_dir"]:
-        st.caption(str(status["bundles_dir"]))
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ---------------------------------------------------------
-# Paths summary table
-# ---------------------------------------------------------
-st.markdown("#### Paths summary")
-rows = []
-for key in ["DATA_ROOT", "ECS_PARQUET_DIR", "FEATURE_TABLE_PATH", "MODELS_DIR", "MODEL_PATH", "SCORES_PATH", "BUNDLES_DIR"]:
-    # get_paths() dùng key lower/underscore; ánh xạ mềm:
-    k = key.lower()
-    val = paths.get(k) if paths else None
-    p = Path(val) if val else None
-    exists = p.exists() if p else False
-    rows.append(
-        {"name": key, "path": str(p) if p else "-", "exists": "✅" if exists else "—"}
+def explain_mitre_with_gemini(tech_id: str, tech_name: str):
+    """Call Gemini to explain a MITRE technique (offline-friendly)."""
+    gkey = os.getenv("GEMINI_API_KEY")
+    if not gkey:
+        return "GEMINI_API_KEY chưa được cấu hình, không thể gọi Gemini."
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        return "Chưa cài đặt google-generativeai. Cài bằng: pip install google-generativeai"
+    prompt = (
+        "Giải thích ngắn gọn kỹ thuật MITRE ATT&CK dưới đây bằng tiếng Việt, "
+        "nhấn mạnh ý nghĩa, dấu hiệu phát hiện và cách phòng thủ:\n"
+        f"- Mã: {tech_id}\n"
+        f"- Tên: {tech_name or tech_id}\n"
+        "Trả lời súc tích (<= 150 từ)."
     )
-df_paths = pd.DataFrame(rows)
-st.dataframe(df_paths, use_container_width=True, hide_index=True)
+    try:
+        genai.configure(api_key=gkey)
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        res = model.generate_content(prompt)
+        return (getattr(res, "text", None) or "").strip() or "Không nhận được phản hồi từ Gemini."
+    except Exception as e:
+        return f"Lỗi khi gọi Gemini: {e}"
 
-st.divider()
+# ---------------------------------------------------------
+# 1) Tổng quan dữ liệu
+# ---------------------------------------------------------
+st.subheader("Tổng quan dữ liệu")
+c1, c2, c3 = st.columns(3)
+c1.metric("Tổng log (scores)", f"{len(df):,}")
+c2.metric("Alerts ≥ threshold", f"{len(alerts):,}")
+c3.metric("Ngưỡng (quantile)", f"{thr:.4f}" if thr is not None else "n/a")
+
+st.caption("Nguồn log đã ingest (event.module / event.dataset)")
+src_cols = []
+if "event.module" in df.columns:
+    src_cols.append("event.module")
+if "event.dataset" in df.columns:
+    src_cols.append("event.dataset")
+if src_cols:
+    src_counts = df[src_cols].fillna("unknown").value_counts().reset_index(name="count")
+    st.dataframe(src_counts, use_container_width=True, hide_index=True)
+else:
+    st.info("Không có cột event.module/event.dataset trong scores.")
+
+# ---------------------------------------------------------
+# 2) Chỉ số phát hiện (nếu có evaluate_report.json)
+# ---------------------------------------------------------
+st.subheader("Chỉ số phát hiện (Precision/Recall/F1/TPR/FPR/MTTD/MTTR)")
+if eval_report_path.exists():
+    with open(eval_report_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+    metrics = report.get("metrics", {})
+    counts = report.get("counts", {})
+    mcols = st.columns(5)
+    mcols[0].metric("Precision", f"{metrics.get('Precision', 0):.3f}")
+    mcols[1].metric("Recall/TPR", f"{metrics.get('Recall', 0):.3f}")
+    mcols[2].metric("F1", f"{metrics.get('F1', 0):.3f}")
+    mcols[3].metric("FPR", f"{metrics.get('FPR', 0):.3f}")
+    mcols[4].metric("TPR", f"{metrics.get('TPR', 0):.3f}")
+    st.caption(f"Dataset: total={counts.get('total', 0)}, positive={counts.get('positive', 0)}, negative={counts.get('negative', 0)}")
+else:
+    st.info("Chưa có evaluate_report.json (chưa đánh giá bằng nhãn).")
+
+# ---------------------------------------------------------
+# 3) Phân phối rủi ro & anom.score
+# ---------------------------------------------------------
+st.subheader("Phân phối rủi ro")
+risk_counts = alerts["risk_level"].value_counts(dropna=False)
+st.bar_chart(risk_counts)
+
+st.subheader("Phân phối anom.score (histogram)")
+fig_hist, ax_hist = plt.subplots(figsize=(6, 3))
+ax_hist.hist(df["anom.score"], bins=30, color="#3b82f6", alpha=0.8)
+ax_hist.set_xlabel("anom.score")
+ax_hist.set_ylabel("Count")
+st.pyplot(fig_hist)
+
+# ---------------------------------------------------------
+# 4) Ánh xạ MITRE ATT&CK
+# ---------------------------------------------------------
+st.subheader("Ánh xạ MITRE ATT&CK")
+tech_counts = alerts["mitre.techniques"].fillna("").str.split(",").explode().str.strip()
+tech_counts = tech_counts[tech_counts != ""].value_counts()
+if tech_counts.empty:
+    st.caption("Chưa có kỹ thuật MITRE nào được gán.")
+else:
+    st.bar_chart(tech_counts)
+    st.dataframe(
+        tech_counts.reset_index(names="Technique").rename(columns={"mitre.techniques": "Count"})
+        if hasattr(tech_counts, "name")
+        else tech_counts.reset_index(),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# MITRE technique links + Gemini explanation
+mitre_list = _collect_mitre_techniques(alerts)
+st.subheader("MITRE kỹ thuật (click để mở, nhấn để giải thích)")
+if mitre_list:
+    options = [f"{x['id']} – {x['name']}" if x["name"] else x["id"] for x in mitre_list]
+    sel = st.selectbox("Chọn kỹ thuật", options)
+    current = mitre_list[options.index(sel)]
+    url = _technique_url(current["id"])
+    st.markdown(f"[{sel}]({url})")
+
+    # Lưu cache trong session để không mất khi rerun
+    if "mitre_exp" not in st.session_state:
+        st.session_state["mitre_exp"] = {}
+
+    if st.button("Giải thích bằng Gemini", key=f"btn_{current['id']}"):
+        with st.spinner("Đang gọi Gemini..."):
+            expl = explain_mitre_with_gemini(current["id"], current["name"])
+        st.session_state["mitre_exp"][current["id"]] = expl
+
+    cached = st.session_state["mitre_exp"].get(current["id"])
+    if cached:
+        st.markdown("**Giải thích Gemini:**")
+        st.markdown(cached)
+    else:
+        st.caption("Nhấn nút để lấy giải thích từ Gemini (nếu đã cấu hình GEMINI_API_KEY).")
+else:
+    st.caption("Chưa có kỹ thuật MITRE trong dữ liệu alerts.")
+
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# 5) Timeline alert
+# ---------------------------------------------------------
+st.subheader("Timeline alert")
+if not alerts.empty:
+    alerts_ts = alerts.set_index("@timestamp").sort_index()
+    line = alerts_ts["anom.score"].resample("1min").count()
+    fig_tl, ax_tl = plt.subplots(figsize=(10, 3))
+    ax_tl.plot(line.index, line.values, linewidth=1)
+    ax_tl.set_ylabel("Alerts per minute")
+    ax_tl.set_xlabel("Time")
+    st.pyplot(fig_tl)
+else:
+    st.caption("Chưa có alert.")
+
+# ---------------------------------------------------------
+# 6) Bảng chi tiết alert + lọc
+# ---------------------------------------------------------
+st.subheader("Bảng chi tiết alert")
+flt_col1, flt_col2 = st.columns(2)
+with flt_col1:
+    risk_opts = sorted(alerts["risk_level"].dropna().unique())
+    sel_risk = st.multiselect("Lọc risk_level", risk_opts, default=[])
+with flt_col2:
+    tech_opts = sorted({t.strip() for v in alerts.get("mitre.techniques", pd.Series([])).dropna() for t in str(v).split(",") if t.strip()})
+    sel_tech = st.multiselect("Lọc MITRE technique", tech_opts, default=[])
+
+df_view = alerts.copy()
+if sel_risk:
+    df_view = df_view[df_view["risk_level"].isin(sel_risk)]
+if sel_tech and "mitre.techniques" in df_view.columns:
+    df_view = df_view[df_view["mitre.techniques"].apply(lambda x: any(t in str(x) for t in sel_tech))]
+
+cols_show = [
+    c
+    for c in [
+        "@timestamp",
+        "host.name",
+        "user.name",
+        "source.ip",
+        "destination.ip",
+        "destination.port",
+        "anom.score",
+        "risk_level",
+        "mitre.techniques",
+    ]
+    if c in df_view.columns
+]
+st.dataframe(df_view[cols_show].sort_values("@timestamp"), use_container_width=True, hide_index=True)
+
+st.caption("Chạy pipeline ingest → featurize → train → score để cập nhật báo cáo.")

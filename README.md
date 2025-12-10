@@ -41,6 +41,9 @@ Dự án này là một hệ thống end-to-end offline giúp:
 Thay vì chạy toàn bộ pipeline, bạn có thể chạy từng bước:
 
 ```bash
+# (Tùy chọn) Sinh dữ liệu giả normal/attack
+python sample_data/generate_synthetic_logs.py
+
 # 1. Ingest logs và chuẩn hóa ECS
 python -m cli.anom_score ingest --reset
 
@@ -61,6 +64,17 @@ python -m cli.anom_score bundle
 
 # 6. Đánh giá mô hình (cần cột label hoặc file nhãn)
 python -m cli.anom_score evaluate --labels-path data/labels/labels.parquet --label-col label
+
+# Huấn luyện trên log bình thường (sample_data/normal) và test trên log tấn công (sample_data/attack)
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/normal
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score train
+
+python -m cli.anom_score ingest --source files --reset --data-dir sample_data/attack
+python -m cli.anom_score featurize --reset
+python -m cli.anom_score score --reset
+python -m cli.anom_score bundle
+python -m cli.anom_score evaluate --labels-path <file_labels> --label-col label
 ```
 
 ## MITRE ATT&CK Mapping

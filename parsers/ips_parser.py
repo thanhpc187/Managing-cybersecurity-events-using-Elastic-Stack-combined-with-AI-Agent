@@ -123,8 +123,8 @@ def parse_ips(path: Optional[Path] = None, enable_udp: bool = False, udp_timeout
     """
     paths = get_paths()
     if path is None:
-        sample_root = Path("sample_data")
-        candidates = list(sample_root.glob("ips*.log")) + list(sample_root.glob("suricata*.log")) + list(sample_root.glob("snort*.log"))
+        sample_root = Path(paths.get("raw_data_dir", "sample_data"))
+        candidates = list(sample_root.glob("**/ips*.log")) + list(sample_root.glob("**/suricata*.log")) + list(sample_root.glob("**/snort*.log"))
         if candidates:
             path = candidates[0]
     if path:

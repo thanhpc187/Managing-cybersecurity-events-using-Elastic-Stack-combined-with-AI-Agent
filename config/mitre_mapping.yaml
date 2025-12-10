@@ -11,8 +11,8 @@
   technique: "T1110"
   subtechnique: "T1110.001"
   conditions:
-    login_failed_count_5m: "> 10"
-    login_failed_ratio_5m: "> 0.8"
+    login_failed_count_5m: "> 7"      # nới lỏng
+    login_failed_ratio_5m: "> 0.4"    # nới lỏng
 
 - id: rule_remote_service
   description: "Kết nối dịch vụ từ xa (RDP/SSH/SMB) được allow"
@@ -27,7 +27,7 @@
   tactic: "Discovery"
   technique: "T1046"
   conditions:
-    uniq_dport_per_src_1m: "> 20"
+    uniq_dport_per_src_1m: "> 8"     # nới lỏng
     conn_suspicious: "== 1"
 
 # Có thể bổ sung rule khác tại đây (ví dụ C2 beacon, exfil, webshell, ...)

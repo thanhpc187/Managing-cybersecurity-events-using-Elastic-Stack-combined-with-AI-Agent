@@ -86,6 +86,7 @@ def ingest_all(
     elastic_user: Optional[str] = None,
     elastic_password: Optional[str] = None,
     enable_udp: bool = False,
+    data_dir: Optional[str] = None,
 ) -> Path:
     """
     Ingest pipeline:
@@ -93,6 +94,10 @@ def ingest_all(
     - source="elasticsearch": đọc trực tiếp từ Elastic (host/index_patterns)
     """
     paths = get_paths()
+    if data_dir:
+        os.environ["RAW_DATA_DIR"] = data_dir
+        os.environ["SAMPLE_DATA_DIR"] = data_dir
+        paths = get_paths()
     out_dir = Path(paths["ecs_parquet_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,7 +113,7 @@ def ingest_all(
         run_ingest()
     except Exception as e:
         print(f"[ingest] Base ingest error: {e}")
-    sample_root = Path(os.getenv("SAMPLE_DATA_DIR", "sample_data"))
+    sample_root = Path(os.getenv("SAMPLE_DATA_DIR", data_dir or "sample_data"))
     if parse_auth_logs:
         try:
             parse_auth_logs(sample_root)

@@ -31,6 +31,10 @@ def get_paths() -> Dict[str, str]:
     # Convert to absolute paths under project root
     resolved = {}
     for key, rel in cfg.items():
+        override_env = os.getenv(key.upper())  # RAW_DATA_DIR, ECS_PARQUET_DIR...
+        if override_env:
+            resolved[key] = override_env
+            continue
         if isinstance(rel, list):
             resolved[key] = rel
         elif isinstance(rel, (int, float)):

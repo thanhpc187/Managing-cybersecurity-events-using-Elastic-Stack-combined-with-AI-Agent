@@ -100,6 +100,7 @@ def _match_value(actual: Any, cond_val: Any) -> bool:
 def _conditions_pass(rule_conditions: Dict[str, Any], record: Dict[str, Any]) -> bool:
     for field, cond in (rule_conditions or {}).items():
         actual = _get_val(record, field)
+        # Nếu field không tồn tại hoặc None, xem như không match
         if actual is None:
             return False
         if not _match_value(actual, cond):
