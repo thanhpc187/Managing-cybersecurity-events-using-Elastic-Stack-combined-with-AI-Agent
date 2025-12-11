@@ -38,7 +38,19 @@ def load_mitre_mapping() -> List[Dict[str, Any]]:
 
 
 def _get_val(obj: Dict[str, Any], key: str) -> Any:
-    """Get value from nested dict using dot-path."""
+    """
+    Lấy giá trị từ dict hỗ trợ cả:
+    - Kiểu "phẳng" từ DataFrame (key có dấu chấm, ví dụ "labels.attack_type")
+    - Kiểu lồng nhau theo dot-path (record["labels"]["attack_type"])
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    # 1) Thử key phẳng trước (phù hợp với dict từ DataFrame.to_dict)
+    if key in obj:
+        return obj[key]
+
+    # 2) Nếu không có, thử truy cập lồng nhau theo dot-path
     cur: Any = obj
     for part in key.split("."):
         if isinstance(cur, dict) and part in cur:

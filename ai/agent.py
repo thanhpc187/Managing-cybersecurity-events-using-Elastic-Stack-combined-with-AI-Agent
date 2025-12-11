@@ -10,6 +10,7 @@ Original repository: https://github.com/thanhpc187/Managing-cybersecurity-events
 from __future__ import annotations
 import os
 import re
+import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -320,6 +321,7 @@ def _map_mitre(alert: Dict[str, Any], shap_items: List[Dict[str, Any]]) -> List[
         hits.append("T1021 Remote Services")
     return _dedup_keep_order(hits)
 
+
 # --------- Gọi LLM ---------
 def _call_deepseek(prompt: str, timeout: int = 30) -> Optional[str]:
     """Gọi DeepSeek API để phân tích alert."""
@@ -394,6 +396,205 @@ def _call_gemini(prompt: str) -> Optional[str]:
         logger.exception(f"Gemini call failed: {e}")
         return None
 
+
+def _call_gemini_mapping(
+    alert: Dict[str, Any],
+    shap_items: List[Dict[str, Any]],
+    context_rows: List[Dict[str, Any]],
+) -> tuple[
+    List[str],
+    List[Dict[str, Any]],
+    str,
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    """
+    Gọi Gemini để suy đoán MITRE/NIST khi rule-based mapping không match gì.
+    Trả về: (mitre_list, nist_list, reason_text)
+    """
+    # Nếu chưa cấu hình GEMINI_API_KEY thì bỏ qua
+    if not os.getenv("GEMINI_API_KEY"):
+        return [], [], "", [], []
+
+    # Lấy một số field quan trọng làm ngữ cảnh
+    def g(key: str, default: Any = "") -> Any:
+        return alert.get(key, default) if isinstance(alert, dict) else default
+
+    ts = str(g("@timestamp", ""))
+    score = g("anom.score", "")
+    host = g("host.name", "")
+    user = g("user.name", "")
+    src_ip = g("source.ip", "")
+    dst_ip = g("destination.ip", "")
+    dport = g("destination.port", "")
+    action = g("event.action", "")
+    module = g("event.module", "")
+    dataset = g("event.dataset", "")
+    message = str(g("message", ""))[:200]
+
+    # Top 3 SHAP feature để gợi ý cho LLM
+    top_feats: List[str] = []
+    for x in _as_list(shap_items)[:3]:
+        if not isinstance(x, dict):
+            continue
+        feat = str(x.get("feature") or "unknown")
+        val = x.get("value")
+        try:
+            val_f = float(val)
+            top_feats.append(f"{feat}({val_f:+.3f})")
+        except Exception:
+            top_feats.append(feat)
+
+    # Bản tóm tắt cho prompt
+    summary = {
+        "@timestamp": ts,
+        "anom.score": score,
+        "host.name": host,
+        "user.name": user,
+        "source.ip": src_ip,
+        "destination.ip": dst_ip,
+        "destination.port": dport,
+        "event.action": action,
+        "event.module": module,
+        "event.dataset": dataset,
+        "message_snippet": message,
+        "top_features": top_feats,
+    }
+    top_shap_features = ", ".join(top_feats) if top_feats else ""
+
+    schema = {
+        "mitre": ["T1110", "T1046"],
+        "nist": [
+            {"function": "DETECT", "category": "DE.CM", "subcategory": "DE.CM-7"}
+        ],
+        "reason": "1–2 câu giải thích ngắn",
+        "mitre_details": [
+            {
+                "code": "T1110",
+                "description": "Giải thích ngắn (50–100 chữ) về kỹ thuật T1110",
+                "url": "https://attack.mitre.org/techniques/T1110/",
+            }
+        ],
+        "nist_details": [
+            {
+                "function": "DETECT",
+                "category": "DE.CM",
+                "subcategory": "DE.CM-7",
+                "description": "Mô tả ngắn (50–100 chữ) về subcategory DE.CM-7",
+                "url": "https://nvd.nist.gov/...",
+            }
+        ],
+    }
+
+    prompt = f"""
+Bạn là chuyên gia SOC. Dựa trên thông tin alert sau đây, hãy xác định kỹ thuật MITRE ATT&CK (mã Txxxx) và Function/Category/Subcategory của NIST CSF 2.0. 
+Thông tin alert:
+- Thời điểm: {ts}
+- Điểm bất thường: {score}
+- Host: {host}, User: {user}
+- Source: {src_ip}:{g('source.port')}
+- Destination: {dst_ip}:{dport}
+- Module: {module}, Dataset: {dataset}
+- Hành động: {action}
+- Lược trích message: {message}
+- Top 3 đặc trưng SHAP: {top_shap_features}
+
+Alert (JSON tóm tắt):
+{json.dumps(summary, ensure_ascii=False)}
+
+YÊU CẦU BẮT BUỘC:
+- TRẢ LỜI DUY NHẤT BẰNG MỘT JSON HỢP LỆ, KHÔNG CÓ CHỮ NÀO BÊN NGOÀI JSON.
+- Không giải thích ngoài JSON.
+
+JSON PHẢI CÓ CẤU TRÚC (MINH HỌA):
+{json.dumps(schema, ensure_ascii=False)}
+"""
+
+    text = _call_gemini(prompt)
+    if not text:
+        return [], [], "", [], []
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        logger.warning("Không parse được JSON từ Gemini mapping")
+        return [], [], "", [], []
+
+    mitre_list: List[str] = []
+    nist_list: List[Dict[str, Any]] = []
+    mitre_details: List[Dict[str, Any]] = []
+    nist_details: List[Dict[str, Any]] = []
+    reason = ""
+
+    # Parse MITRE list
+    try:
+        raw_mitre = data.get("mitre") or []
+        if isinstance(raw_mitre, list):
+            mitre_list = [str(t).strip().upper() for t in raw_mitre if str(t).strip()]
+    except Exception:
+        logger.debug("Lỗi đọc trường 'mitre' từ JSON LLM")
+
+    # Parse detailed MITRE objects
+    try:
+        raw_md = data.get("mitre_details") or []
+        if isinstance(raw_md, list):
+            for item in raw_md:
+                if not isinstance(item, dict):
+                    continue
+                mitre_details.append(
+                    {
+                        "code": str(item.get("code") or "").strip().upper(),
+                        "description": str(item.get("description") or "").strip(),
+                        "url": str(item.get("url") or "").strip(),
+                    }
+                )
+    except Exception:
+        logger.debug("Lỗi đọc trường 'mitre_details' từ JSON LLM")
+
+    # Parse NIST list (function/category/subcategory)
+    try:
+        raw_nist = data.get("nist") or []
+        if isinstance(raw_nist, list):
+            for item in raw_nist:
+                if not isinstance(item, dict):
+                    continue
+                nist_list.append(
+                    {
+                        "function": str(item.get("function") or "").strip().upper(),
+                        "category": str(item.get("category") or "").strip().upper(),
+                        "subcategory": str(item.get("subcategory") or "").strip(),
+                    }
+                )
+    except Exception:
+        logger.debug("Lỗi đọc trường 'nist' từ JSON LLM")
+
+    # Parse detailed NIST objects
+    try:
+        raw_nd = data.get("nist_details") or []
+        if isinstance(raw_nd, list):
+            for item in raw_nd:
+                if not isinstance(item, dict):
+                    continue
+                nist_details.append(
+                    {
+                        "function": str(item.get("function") or "").strip().upper(),
+                        "category": str(item.get("category") or "").strip().upper(),
+                        "subcategory": str(item.get("subcategory") or "").strip(),
+                        "description": str(item.get("description") or "").strip(),
+                        "url": str(item.get("url") or "").strip(),
+                    }
+                )
+    except Exception:
+        logger.debug("Lỗi đọc trường 'nist_details' từ JSON LLM")
+
+    try:
+        reason_raw = data.get("reason") or ""
+        reason = str(reason_raw).strip()
+    except Exception:
+        reason = ""
+
+    return mitre_list, nist_list, reason, mitre_details, nist_details
+
 # --------- API chính ---------
 def analyze_alert_with_llm(
     alert: Dict[str, Any],
@@ -412,6 +613,14 @@ def analyze_alert_with_llm(
     Returns:
         Dict chứa risk_level, score, reason, iocs, actions, raw_text, provider, alert_time
     """
+    # Chấp nhận cả pandas.Series (từ iterrows) và chuyển về dict
+    try:
+        import pandas as _pd  # type: ignore
+        if isinstance(alert, _pd.Series):
+            alert = alert.to_dict()
+    except Exception:
+        pass
+
     if not isinstance(alert, dict):
         logger.error("Alert phải là dict")
         alert = {}
@@ -434,10 +643,28 @@ def analyze_alert_with_llm(
     entities = _extract_entities(alert, context_rows)
     correlations = _correlate_multisource(alert, context_rows)
     mitre_hits = _map_mitre(alert, shap_items)
+
+    # Rule-based MITRE/NIST mapping
     mapping_config = load_mitre_mapping()
     mitre_auto = map_to_mitre(alert, features_row, mapping_config)
     nist_config = load_nist_mapping()
     nist_auto = map_to_nist(alert, mitre_auto, nist_config)
+
+    # LLM-based mapping fallback (chỉ dùng khi rule-based không match gì)
+    mitre_llm: List[str] = []
+    nist_llm: List[Dict[str, Any]] = []
+    mitre_llm_details: List[Dict[str, Any]] = []
+    nist_llm_details: List[Dict[str, Any]] = []
+    mapping_reason: str = ""
+    if not mitre_auto and not nist_auto:
+        (
+            mitre_llm,
+            nist_llm,
+            mapping_reason,
+            mitre_llm_details,
+            nist_llm_details,
+        ) = _call_gemini_mapping(alert, shap_items, context_rows)
+
     actions = _suggest_actions(alert)
 
     # Helper để lấy giá trị an toàn
@@ -497,10 +724,23 @@ def analyze_alert_with_llm(
         all_mitre.extend([a for a in auto_labels if a])
     if all_mitre:
         markdown_lines.append("- MITRE: " + ", ".join(_dedup_keep_order(all_mitre)))
+
+    # Nếu rule-based không ra kỹ thuật nhưng LLM có suy đoán -> ghi riêng
+    if not mitre_auto and mitre_llm:
+        markdown_lines.append("- MITRE (LLM): " + ", ".join(_dedup_keep_order(mitre_llm)))
+
     if nist_auto:
         nist_tags = [f"{n.get('function')} ({n.get('category')})" for n in nist_auto if n.get("function")]
         if nist_tags:
             markdown_lines.append("- NIST CSF: " + ", ".join(_dedup_keep_order(nist_tags)))
+
+    if not nist_auto and nist_llm:
+        nist_tags_llm = [f"{n.get('function')} ({n.get('category')})" for n in nist_llm if n.get("function")]
+        if nist_tags_llm:
+            markdown_lines.append("- NIST CSF (LLM): " + ", ".join(_dedup_keep_order(nist_tags_llm)))
+
+    if mapping_reason:
+        markdown_lines.append("- Giải thích mapping LLM: " + _truncate(mapping_reason, 400))
     if correlations:
         markdown_lines.append("- Tương quan:")
         for c in correlations[:5]:
@@ -536,6 +776,11 @@ def analyze_alert_with_llm(
         "mitre": mitre_hits,
         "mitre_attack": mitre_payload,
         "nist_csf": nist_auto,
+        "mitre_llm": mitre_llm,
+        "nist_llm": nist_llm,
+        "mitre_llm_details": mitre_llm_details,
+        "nist_llm_details": nist_llm_details,
+        "llm_mapping_reason": mapping_reason,
         "correlations": correlations,
         "markdown": "\n".join(markdown_lines),
     }

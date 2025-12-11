@@ -268,19 +268,20 @@ if tech_counts.empty:
     st.caption("Chưa có kỹ thuật MITRE nào được gán.")
 else:
     st.bar_chart(tech_counts)
-    tech_df = tech_counts.reset_index(names="Technique")
-    # Sau reset_index, cột đếm mặc định là 'count' -> đổi thành 'Count'
-    if "count" in tech_df.columns:
-        tech_df = tech_df.rename(columns={"count": "Count"})
+    # Với pandas cũ, Series.reset_index không hỗ trợ tham số names
+    tech_df = tech_counts.reset_index()
+    # Chuẩn hóa tên cột: [Technique, Count]
+    if len(tech_df.columns) >= 2:
+        tech_df.columns = ["Technique", "Count"]
     st.dataframe(
         tech_df,
         use_container_width=True,
         hide_index=True,
     )
 
-# MITRE technique links + Gemini explanation
+# MITRE technique links + Gemini explanation (tự động)
 mitre_list = _collect_mitre_techniques(alerts)
-st.subheader("MITRE ATT&CK")
+st.subheader("MITRE ATT&CK – giải thích kỹ thuật")
 if mitre_list:
     options = [f"{x['id']} – {x['name']}" if x["name"] else x["id"] for x in mitre_list]
     sel = st.selectbox("Chọn kỹ thuật", options)
@@ -288,21 +289,20 @@ if mitre_list:
     url = _technique_url(current["id"])
     st.markdown(f"[{sel}]({url})")
 
-    # Lưu cache trong session để không mất khi rerun
+    # Cache trong session để tránh gọi Gemini lặp lại
     if "mitre_exp" not in st.session_state:
         st.session_state["mitre_exp"] = {}
 
-    if st.button("Giải thích bằng Gemini", key=f"btn_{current['id']}"):
-        with st.spinner("Đang gọi Gemini..."):
-            expl = explain_mitre_with_gemini(current["id"], current["name"])
-        st.session_state["mitre_exp"][current["id"]] = expl
-
     cached = st.session_state["mitre_exp"].get(current["id"])
     if cached:
-        st.markdown("**Giải thích Gemini:**")
-        st.markdown(cached)
+        explanation = cached
     else:
-        st.caption("Nhấn nút để lấy giải thích từ Gemini (nếu đã cấu hình GEMINI_API_KEY).")
+        with st.spinner("Đang tạo giải thích MITRE (Gemini hoặc offline)..."):
+            explanation = explain_mitre_with_gemini(current["id"], current["name"])
+        st.session_state["mitre_exp"][current["id"]] = explanation
+
+    st.markdown("**Giải thích kỹ thuật:**")
+    st.markdown(explanation)
 else:
     st.caption("Chưa có kỹ thuật MITRE trong dữ liệu alerts.")
 
@@ -316,10 +316,11 @@ if nist_counts.empty:
     st.caption("Chưa có mapping NIST CSF nào được gán.")
 else:
     st.bar_chart(nist_counts)
-    nist_df = nist_counts.reset_index(names="Function")
-    # Sau reset_index, cột đếm mặc định là 'count' -> đổi thành 'Count'
-    if "count" in nist_df.columns:
-        nist_df = nist_df.rename(columns={"count": "Count"})
+    # Series.reset_index() trong pandas cũ không nhận tham số names
+    nist_df = nist_counts.reset_index()
+    # Đặt lại tên cột rõ ràng: [Function, Count]
+    if len(nist_df.columns) >= 2:
+        nist_df.columns = ["Function", "Count"]
     st.dataframe(
         nist_df,
         use_container_width=True,
