@@ -2,6 +2,12 @@ from typing import Any, Dict
 
 
 def get_by_path(data: Dict[str, Any], path: str) -> Any:
+    """
+    Safely get value from nested dict using dot-path.
+    Supports both nested dicts and flat keys that already contain dots.
+    """
+    if path in data:
+        return data.get(path)
     cur: Any = data
     for key in path.split('.'):
         if isinstance(cur, dict) and key in cur:

@@ -20,17 +20,22 @@ def add_time_window_counts(
     out = out.dropna(subset=[ts_col]).sort_values(ts_col)
     out[value_col] = pd.to_numeric(out[value_col], errors="coerce").fillna(0).astype(int)
 
-    idx = out.set_index(ts_col)
     for w in windows_min:
         colname = f"{value_col}_count_{w}m"
         try:
             rolled = (
-                idx.groupby(group_cols)[value_col]
-                  .rolling(f"{w}min")
-                  .sum()
-                  .reset_index(level=group_cols, drop=True)
+                out.groupby(group_cols)
+                .rolling(f"{w}min", on=ts_col)[value_col]
+                .sum()
+                .reset_index()
             )
-            out[colname] = rolled.values.astype("float64")
+            # Align back to original rows via join on group_cols + ts_col
+            out = out.merge(
+                rolled.rename(columns={value_col: colname}),
+                on=group_cols + [ts_col],
+                how="left",
+            )
+            out[colname] = out[colname].fillna(0.0).astype("float64")
         except Exception:
             out[colname] = 0.0
     return out

@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from models.utils import get_paths  # noqa: E402
 from explain.thresholding import compute_threshold  # noqa: E402
 from ai.mitre_mapper import load_mitre_mapping, map_to_mitre  # noqa: E402
+from ai.nist_mapper import load_nist_mapping, map_to_nist  # noqa: E402
 
 
 st.set_page_config(page_title="Báo cáo kết quả", layout="wide", page_icon="📊")
@@ -41,22 +42,35 @@ if "@timestamp" in df.columns:
 thr, _ = compute_threshold(df["anom.score"]) if "anom.score" in df.columns and len(df) else (None, 0)
 alerts = df[df["anom.score"] >= thr].copy() if thr is not None else df.head(0)
 
-# Recompute MITRE mapping
+# Recompute MITRE + NIST mapping
 mapping_cfg = load_mitre_mapping()
+nist_cfg = load_nist_mapping()
 if mapping_cfg is not None:
     mitre_tactics = []
     mitre_techs = []
+    nist_funcs = []
+    nist_cats = []
     for _, r in alerts.iterrows():
-        hits = map_to_mitre(r.to_dict(), r.to_dict(), mapping_cfg)
+        rec = r.to_dict()
+        hits = map_to_mitre(rec, rec, mapping_cfg)
         tactics = sorted({h.get("tactic") for h in hits if h.get("tactic")})
         techs = sorted({h.get("technique") for h in hits if h.get("technique")})
         mitre_tactics.append(", ".join(tactics))
         mitre_techs.append(", ".join(techs))
+        nist_hits = map_to_nist(rec, hits, nist_cfg)
+        funcs = sorted({h.get("function") for h in nist_hits if h.get("function")})
+        cats = sorted({h.get("category") for h in nist_hits if h.get("category")})
+        nist_funcs.append(", ".join(funcs))
+        nist_cats.append(", ".join(cats))
     alerts["mitre.tactics"] = mitre_tactics
     alerts["mitre.techniques"] = mitre_techs
+    alerts["nist.functions"] = nist_funcs
+    alerts["nist.categories"] = nist_cats
 else:
     alerts["mitre.tactics"] = ""
     alerts["mitre.techniques"] = ""
+    alerts["nist.functions"] = ""
+    alerts["nist.categories"] = ""
 
 # Risk level fallback
 if "risk_level" not in alerts.columns:
@@ -128,7 +142,33 @@ def explain_mitre_with_gemini(tech_id: str, tech_name: str):
     )
     try:
         genai.configure(api_key=gkey)
-        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+        res = model.generate_content(prompt)
+        return (getattr(res, "text", None) or "").strip() or "Không nhận được phản hồi từ Gemini."
+    except Exception as e:
+        return f"Lỗi khi gọi Gemini: {e}"
+
+
+def summarize_report_with_gemini(payload: dict):
+    """Tóm tắt toàn bộ báo cáo bằng Gemini, có nhắc MITRE nếu có."""
+    gkey = os.getenv("GEMINI_API_KEY")
+    if not gkey:
+        return "GEMINI_API_KEY chưa được cấu hình, không thể gọi Gemini."
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        return "Chưa cài đặt google-generativeai. Cài bằng: pip install google-generativeai"
+
+    prompt = (
+        "Bạn là chuyên gia SOC. Hãy tóm tắt ngắn gọn (<= 150 từ, tiếng Việt) "
+        "về tình trạng báo cáo dưới đây, gồm: khối lượng log, số alert, ngưỡng, "
+        "phân bố rủi ro, MITRE kỹ thuật (nếu có), và nhận định tổng quan/rủi ro. "
+        "Nếu không có MITRE, nêu rõ. Không dài dòng.\n\n"
+        f"Dữ liệu: {json.dumps(payload, ensure_ascii=False)}"
+    )
+    try:
+        genai.configure(api_key=gkey)
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
         res = model.generate_content(prompt)
         return (getattr(res, "text", None) or "").strip() or "Không nhận được phản hồi từ Gemini."
     except Exception as e:
@@ -156,7 +196,37 @@ else:
     st.info("Không có cột event.module/event.dataset trong scores.")
 
 # ---------------------------------------------------------
-# 2) Chỉ số phát hiện (nếu có evaluate_report.json)
+# 2) Kết luận tổng quan (Gemini)
+# ---------------------------------------------------------
+st.subheader("Kết luận tổng quan")
+summary_payload = {
+    "total_events": len(df),
+    "alert_count": len(alerts),
+    "threshold": thr,
+    "risk_counts": alerts["risk_level"].value_counts(dropna=False).to_dict(),
+    "mitre_techniques": [x["id"] for x in _collect_mitre_techniques(alerts)],
+    "nist_functions": alerts.get("nist.functions", pd.Series([], dtype=str)).value_counts().to_dict()
+    if "nist.functions" in alerts.columns
+    else {},
+}
+if "report_summary_ai" not in st.session_state:
+    # Auto-generate once on load if có GEMINI_API_KEY
+    if os.getenv("GEMINI_API_KEY"):
+        st.session_state["report_summary_ai"] = summarize_report_with_gemini(summary_payload)
+    else:
+        st.session_state["report_summary_ai"] = ""
+
+if st.session_state["report_summary_ai"]:
+    st.markdown(st.session_state["report_summary_ai"])
+else:
+    st.caption("Chưa có GEMINI_API_KEY hoặc chưa sinh tóm tắt.")
+    if st.button("Sinh tóm tắt báo cáo bằng Gemini"):
+        with st.spinner("Đang gọi Gemini..."):
+            st.session_state["report_summary_ai"] = summarize_report_with_gemini(summary_payload)
+        st.markdown(st.session_state["report_summary_ai"])
+
+# ---------------------------------------------------------
+# 3) Chỉ số phát hiện (nếu có evaluate_report.json)
 # ---------------------------------------------------------
 st.subheader("Chỉ số phát hiện (Precision/Recall/F1/TPR/FPR/MTTD/MTTR)")
 if eval_report_path.exists():
@@ -175,7 +245,7 @@ else:
     st.info("Chưa có evaluate_report.json (chưa đánh giá bằng nhãn).")
 
 # ---------------------------------------------------------
-# 3) Phân phối rủi ro & anom.score
+# 4) Phân phối rủi ro & anom.score
 # ---------------------------------------------------------
 st.subheader("Phân phối rủi ro")
 risk_counts = alerts["risk_level"].value_counts(dropna=False)
@@ -208,7 +278,7 @@ else:
 
 # MITRE technique links + Gemini explanation
 mitre_list = _collect_mitre_techniques(alerts)
-st.subheader("MITRE kỹ thuật (click để mở, nhấn để giải thích)")
+st.subheader("MITRE ATT&CK")
 if mitre_list:
     options = [f"{x['id']} – {x['name']}" if x["name"] else x["id"] for x in mitre_list]
     sel = st.selectbox("Chọn kỹ thuật", options)
@@ -235,8 +305,25 @@ else:
     st.caption("Chưa có kỹ thuật MITRE trong dữ liệu alerts.")
 
 # ---------------------------------------------------------
+# 5) NIST CSF 2.0
 # ---------------------------------------------------------
-# 5) Timeline alert
+st.subheader("NIST CSF 2.0")
+nist_counts = alerts["nist.functions"].fillna("").str.split(",").explode().str.strip()
+nist_counts = nist_counts[nist_counts != ""].value_counts()
+if nist_counts.empty:
+    st.caption("Chưa có mapping NIST CSF nào được gán.")
+else:
+    st.bar_chart(nist_counts)
+    st.dataframe(
+        nist_counts.reset_index(names="Function").rename(columns={"nist.functions": "Count"})
+        if hasattr(nist_counts, "name")
+        else nist_counts.reset_index(),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# ---------------------------------------------------------
+# 6) Timeline alert
 # ---------------------------------------------------------
 st.subheader("Timeline alert")
 if not alerts.empty:
@@ -254,19 +341,24 @@ else:
 # 6) Bảng chi tiết alert + lọc
 # ---------------------------------------------------------
 st.subheader("Bảng chi tiết alert")
-flt_col1, flt_col2 = st.columns(2)
+flt_col1, flt_col2, flt_col3 = st.columns(3)
 with flt_col1:
     risk_opts = sorted(alerts["risk_level"].dropna().unique())
     sel_risk = st.multiselect("Lọc risk_level", risk_opts, default=[])
 with flt_col2:
     tech_opts = sorted({t.strip() for v in alerts.get("mitre.techniques", pd.Series([])).dropna() for t in str(v).split(",") if t.strip()})
     sel_tech = st.multiselect("Lọc MITRE technique", tech_opts, default=[])
+with flt_col3:
+    nist_opts = sorted({t.strip() for v in alerts.get("nist.functions", pd.Series([])).dropna() for t in str(v).split(",") if t.strip()})
+    sel_nist = st.multiselect("Lọc NIST function", nist_opts, default=[])
 
 df_view = alerts.copy()
 if sel_risk:
     df_view = df_view[df_view["risk_level"].isin(sel_risk)]
 if sel_tech and "mitre.techniques" in df_view.columns:
     df_view = df_view[df_view["mitre.techniques"].apply(lambda x: any(t in str(x) for t in sel_tech))]
+if sel_nist and "nist.functions" in df_view.columns:
+    df_view = df_view[df_view["nist.functions"].apply(lambda x: any(t in str(x) for t in sel_nist))]
 
 cols_show = [
     c
@@ -280,6 +372,7 @@ cols_show = [
         "anom.score",
         "risk_level",
         "mitre.techniques",
+        "nist.functions",
     ]
     if c in df_view.columns
 ]

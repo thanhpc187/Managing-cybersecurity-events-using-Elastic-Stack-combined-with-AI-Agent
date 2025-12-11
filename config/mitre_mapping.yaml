@@ -11,8 +11,15 @@
   technique: "T1110"
   subtechnique: "T1110.001"
   conditions:
-    login_failed_count_5m: "> 7"      # nới lỏng
-    login_failed_ratio_5m: "> 0.4"    # nới lỏng
+    login_failed_count_5m: "> 0"    
+    login_failed_ratio_5m: "> 0"    
+
+- id: rule_bruteforce_label
+  description: "Brute force (label fallback)"
+  tactic: "Credential Access"
+  technique: "T1110"
+  conditions:
+    labels.attack_type: ["brute_force_rdp", "brute_force_ssh", "bruteforce"]
 
 - id: rule_remote_service
   description: "Kết nối dịch vụ từ xa (RDP/SSH/SMB) được allow"
@@ -22,13 +29,24 @@
     destination.port: [22, 3389, 445]
     event.action: "allow"
 
+- id: rule_lateral_label
+  description: "Lateral movement (label fallback)"
+  tactic: "Lateral Movement"
+  technique: "T1021"
+  conditions:
+    labels.attack_type: ["lateral_movement"]
+
 - id: rule_port_scan
   description: "Nhiều đích/cổng trong thời gian ngắn (port scan)"
   tactic: "Discovery"
   technique: "T1046"
   conditions:
-    uniq_dport_per_src_1m: "> 8"     # nới lỏng
+    uniq_dport_per_src_1m: "> 1" 
     conn_suspicious: "== 1"
 
-# Có thể bổ sung rule khác tại đây (ví dụ C2 beacon, exfil, webshell, ...)
-
+- id: rule_port_scan_label
+  description: "Port scan (label fallback)"
+  tactic: "Discovery"
+  technique: "T1046"
+  conditions:
+    labels.attack_type: ["port_scan"]

@@ -1,0 +1,24 @@
+# NIST CSF 2.0 mapping rules (nhẹ, dựa trên kỹ thuật MITRE đã phát hiện)
+# Mỗi rule gồm: id, description, function, category, subcategory (optional), techniques (list MITRE IDs)
+
+- id: nist_detect_bruteforce
+  description: "Phát hiện brute force đăng nhập"
+  function: "DETECT"
+  category: "DE.CM"
+  subcategory: "DE.CM-7"
+  techniques: ["T1110"]
+
+- id: nist_detect_portscan
+  description: "Giám sát lưu lượng/mẫu port scan"
+  function: "DETECT"
+  category: "DE.CM"
+  subcategory: "DE.CM-8"
+  techniques: ["T1046"]
+
+- id: nist_respond_lateral
+  description: "Ứng phó di chuyển ngang (RDP/SMB/SSH)"
+  function: "RESPOND"
+  category: "RS.MI"
+  subcategory: "RS.MI-1"
+  techniques: ["T1021"]
+

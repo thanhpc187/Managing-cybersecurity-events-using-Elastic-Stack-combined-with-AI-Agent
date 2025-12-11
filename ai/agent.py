@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 
 from .mitre_mapper import load_mitre_mapping, map_to_mitre
+from .nist_mapper import load_nist_mapping, map_to_nist
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +377,7 @@ def _call_gemini(prompt: str) -> Optional[str]:
     try:
         import google.generativeai as genai  # pip install google-generativeai
         genai.configure(api_key=gkey)
-        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+        model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
         full_prompt = "Trả lời bằng tiếng Việt, ngắn gọn, hành động được.\n\n" + prompt
         res = model.generate_content(full_prompt)
         result = (getattr(res, "text", None) or "").strip()
@@ -435,6 +436,8 @@ def analyze_alert_with_llm(
     mitre_hits = _map_mitre(alert, shap_items)
     mapping_config = load_mitre_mapping()
     mitre_auto = map_to_mitre(alert, features_row, mapping_config)
+    nist_config = load_nist_mapping()
+    nist_auto = map_to_nist(alert, mitre_auto, nist_config)
     actions = _suggest_actions(alert)
 
     # Helper để lấy giá trị an toàn
@@ -494,6 +497,10 @@ def analyze_alert_with_llm(
         all_mitre.extend([a for a in auto_labels if a])
     if all_mitre:
         markdown_lines.append("- MITRE: " + ", ".join(_dedup_keep_order(all_mitre)))
+    if nist_auto:
+        nist_tags = [f"{n.get('function')} ({n.get('category')})" for n in nist_auto if n.get("function")]
+        if nist_tags:
+            markdown_lines.append("- NIST CSF: " + ", ".join(_dedup_keep_order(nist_tags)))
     if correlations:
         markdown_lines.append("- Tương quan:")
         for c in correlations[:5]:
@@ -528,6 +535,7 @@ def analyze_alert_with_llm(
         "alert_time": str(safe_get("@timestamp", "N/A")),
         "mitre": mitre_hits,
         "mitre_attack": mitre_payload,
+        "nist_csf": nist_auto,
         "correlations": correlations,
         "markdown": "\n".join(markdown_lines),
     }

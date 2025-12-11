@@ -151,6 +151,8 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             "destination.ip",  # Cần cho sessionize
             "network.bytes", "network.packets",
             "rule.id",
+            "labels.is_attack",
+            "labels.attack_type",
         ]
         for col in required_cols:
             if col not in ecs.columns:
@@ -292,13 +294,17 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             "host.name",
             "user.name",
             "source.ip",
+            "source.port",
             "destination.ip",
+            "destination.port",
             "session.id",
             "event.action",
             "event.module",
             "event.dataset",
             "event.severity",
             "network.protocol",
+            "labels.is_attack",
+            "labels.attack_type",
         ]
         for c in id_cols:
             if c not in ecs.columns:

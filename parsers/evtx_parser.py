@@ -8,19 +8,35 @@ from parsers.base_reader import read_jsonl, write_partitioned_parquet
 from parsers.ecs_mapper import map_record
 
 
+def _looks_like_ecs(records: List[Dict]) -> bool:
+    """Heuristic: file đã ở dạng ECS (synthetic) nếu có @timestamp + event.code."""
+    if not records:
+        return False
+    r0 = records[0]
+    return "@timestamp" in r0 and "event.code" in r0
+
+
 def parse_evtx() -> Path:
     paths = get_paths()
     raw = Path(paths["raw_data_dir"]) / "windows_evtx.jsonl"
     ecs_parquet_dir = Path(paths["ecs_parquet_dir"]).resolve()
 
-    mapping = load_yaml(Path(__file__).resolve().parents[1] / "config" / "ecs_mapping.yaml")
-    cfg = mapping["windows_evtx"]
-
     records: List[Dict] = read_jsonl(raw)
-    ecs_rows = [map_record(rec, cfg) for rec in records]
-    df = pd.DataFrame(ecs_rows)
-    df["event.module"] = "windows"
-    df["event.dataset"] = "security"
+    if _looks_like_ecs(records):
+        df = pd.DataFrame(records)
+        df["@timestamp"] = pd.to_datetime(df["@timestamp"], errors="coerce", utc=True)
+        if "event.module" not in df.columns:
+            df["event.module"] = "windows"
+        if "event.dataset" not in df.columns:
+            df["event.dataset"] = "windows.security"
+    else:
+        mapping = load_yaml(Path(__file__).resolve().parents[1] / "config" / "ecs_mapping.yaml")
+        cfg = mapping["windows_evtx"]
+        ecs_rows = [map_record(rec, cfg) for rec in records]
+        df = pd.DataFrame(ecs_rows)
+        df["event.module"] = "windows"
+        df["event.dataset"] = "security"
+
     df = df.dropna(subset=["@timestamp"])  # ensure ts present
     write_partitioned_parquet(df, Path(paths["ecs_parquet_dir"]), "windows_evtx")
     return ecs_parquet_dir
