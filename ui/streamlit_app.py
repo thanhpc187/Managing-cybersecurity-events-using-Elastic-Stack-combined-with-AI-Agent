@@ -268,10 +268,12 @@ if tech_counts.empty:
     st.caption("Chưa có kỹ thuật MITRE nào được gán.")
 else:
     st.bar_chart(tech_counts)
+    tech_df = tech_counts.reset_index(names="Technique")
+    # Sau reset_index, cột đếm mặc định là 'count' -> đổi thành 'Count'
+    if "count" in tech_df.columns:
+        tech_df = tech_df.rename(columns={"count": "Count"})
     st.dataframe(
-        tech_counts.reset_index(names="Technique").rename(columns={"mitre.techniques": "Count"})
-        if hasattr(tech_counts, "name")
-        else tech_counts.reset_index(),
+        tech_df,
         use_container_width=True,
         hide_index=True,
     )
@@ -314,10 +316,12 @@ if nist_counts.empty:
     st.caption("Chưa có mapping NIST CSF nào được gán.")
 else:
     st.bar_chart(nist_counts)
+    nist_df = nist_counts.reset_index(names="Function")
+    # Sau reset_index, cột đếm mặc định là 'count' -> đổi thành 'Count'
+    if "count" in nist_df.columns:
+        nist_df = nist_df.rename(columns={"count": "Count"})
     st.dataframe(
-        nist_counts.reset_index(names="Function").rename(columns={"nist.functions": "Count"})
-        if hasattr(nist_counts, "name")
-        else nist_counts.reset_index(),
+        nist_df,
         use_container_width=True,
         hide_index=True,
     )
