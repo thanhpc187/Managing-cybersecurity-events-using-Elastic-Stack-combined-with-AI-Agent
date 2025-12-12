@@ -74,6 +74,48 @@ def ingest_from_elastic(
         print("[ingest] No records fetched from Elasticsearch.")
         return None
     df = pd.DataFrame(records)
+
+    # Chuẩn hóa cột host: một số log có host là object (dict) với hostname/ip,
+    # số khác chỉ có ip; nếu giữ nguyên dạng object, pyarrow sẽ lỗi khi ghi parquet.
+    if "host" in df.columns:
+        def _extract_host_name(value):
+            if isinstance(value, dict):
+                if "name" in value:
+                    return value["name"]
+                if "hostname" in value:
+                    return value["hostname"]
+            return None
+
+        host_name = df["host"].apply(_extract_host_name)
+
+        # Fallback: nếu có cột hostname riêng thì dùng để lấp chỗ trống
+        if "hostname" in df.columns:
+            host_name = host_name.fillna(df["hostname"])
+
+        # Fallback: với Windows event, lấy từ winlog.computer_name nếu có
+        if "winlog" in df.columns:
+            def _from_winlog(value):
+                if isinstance(value, dict):
+                    return value.get("computer_name")
+                return None
+
+            host_name = host_name.fillna(df["winlog"].apply(_from_winlog))
+
+        df["host.name"] = host_name
+
+        def _extract_host_ip(value):
+            if isinstance(value, dict) and "ip" in value:
+                ip_val = value["ip"]
+                # Một số log để ip là list, số khác là string
+                if isinstance(ip_val, list) and ip_val:
+                    return ip_val[0]
+                return ip_val
+            return None
+
+        df["host.ip"] = df["host"].apply(_extract_host_ip)
+
+        # Cuối cùng ép cả cột host về string để tránh lỗi Arrow với kiểu object phức tạp
+        df["host"] = df["host"].astype(str)
     out_dir = Path(get_paths()["ecs_parquet_dir"])
     write_partitioned_parquet(df, out_dir, "elastic")
     return out_dir

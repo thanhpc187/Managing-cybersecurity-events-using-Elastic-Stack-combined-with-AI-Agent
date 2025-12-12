@@ -24,24 +24,22 @@ def add_time_window_counts(
     out = out.dropna(subset=[ts_col]).sort_values(ts_col)
     out[value_col] = pd.to_numeric(out[value_col], errors="coerce").fillna(0).astype(int)
 
+    # Dùng hậu tố theo group_cols để tránh trùng tên cột khi cùng một
+    # value_col được window hoá trên nhiều group khác nhau (host.name,
+    # user.name, source.ip, destination.ip, ...).
+    group_suffix = "_".join([c.replace(".", "_") for c in group_cols]) or "all"
+
+    idx = out.set_index(ts_col)
     for w in windows_min:
-        colname = f"{value_col}_count_{w}m"
+        colname = f"{value_col}_count_{group_suffix}_{w}m"
         try:
-            # Dùng set_index + groupby để sau reset_index có lại ts_col
             rolled = (
-                out.set_index(ts_col)
-                .groupby(group_cols)[value_col]
+                idx.groupby(group_cols)[value_col]
                 .rolling(f"{w}min")
                 .sum()
-                .reset_index()
             )
-            # rolled hiện có: group_cols + [ts_col, value_col]
-            out = out.merge(
-                rolled.rename(columns={value_col: colname}),
-                on=group_cols + [ts_col],
-                how="left",
-            )
-            out[colname] = out[colname].fillna(0.0).astype("float64")
+            # rolled là Series cùng kích thước với idx; gán trực tiếp theo thứ tự
+            out[colname] = rolled.values.astype("float64")
         except Exception:
             # Fallback an toàn nếu schema lạ để không làm hỏng pipeline
             out[colname] = 0.0
