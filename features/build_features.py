@@ -141,15 +141,52 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             # Không có timestamp thì bỏ qua ngày này
             continue
 
-        # Bổ sung cột thiếu cần thiết cho feature engineering
+        # ------------------------------------------------------------------
+        # Flatten một số trường ECS lồng nhau (Elastic Agent gửi trực tiếp)
+        # ------------------------------------------------------------------
+        # Một số nguồn log (đặc biệt khi ingest trực tiếp từ Elasticsearch)
+        # có trường dạng dict như: event:{action,code,outcome,...},
+        # source:{ip,port}, destination:{ip,port}, network:{bytes,packets,...}.
+        # Đoạn dưới sẽ "trải phẳng" các trường này ra dạng event.code,
+        # source.ip, destination.port... nếu chưa tồn tại.
+
+        def _flatten_prefix(col: str, keys: list[str]) -> None:
+            if col not in ecs.columns:
+                return
+            ser = ecs[col]
+            if not ser.map(lambda v: isinstance(v, dict)).any():
+                return
+            base = ser.apply(lambda v: v if isinstance(v, dict) else {})
+            for k in keys:
+                flat_col = f"{col}.{k}"
+                if flat_col not in ecs.columns or ecs[flat_col].isna().all():
+                    ecs[flat_col] = base.map(lambda d: d.get(k))
+
+        _flatten_prefix("event", ["code", "outcome", "action", "dataset", "module", "severity"])
+        _flatten_prefix("source", ["ip", "port"])
+        _flatten_prefix("destination", ["ip", "port"])
+        _flatten_prefix("network", ["bytes", "packets", "protocol", "transport"])
+
+        # Bổ sung cột thiếu cần thiết cho feature engineering (sau khi flatten)
         required_cols = [
-            "event.code", "event.outcome", "event.action", "event.module", "event.dataset", "event.severity",
-            "destination.port", "network.protocol", "network.transport",
-            "process.command_line", "process.name",  # process.name cần cho CBS windowing
-            "host.name", "user.name",
-            "source.ip", "source.port",  # Cần cho sessionize
+            "event.code",
+            "event.outcome",
+            "event.action",
+            "event.module",
+            "event.dataset",
+            "event.severity",
+            "destination.port",
+            "network.protocol",
+            "network.transport",
+            "process.command_line",
+            "process.name",  # process.name cần cho CBS windowing
+            "host.name",
+            "user.name",
+            "source.ip",
+            "source.port",  # Cần cho sessionize
             "destination.ip",  # Cần cho sessionize
-            "network.bytes", "network.packets",
+            "network.bytes",
+            "network.packets",
             "rule.id",
             "labels.is_attack",
             "labels.attack_type",
