@@ -20,6 +20,88 @@ from features.sessionize import sessionize_network
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Helpers for real-world ECS from Elastic/Logstash
+# ------------------------------------------------------------------
+def flatten_ecs_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flatten common nested ECS dict columns into dotted columns used by the pipeline.
+    This is common when ingesting documents directly from Elasticsearch/Elastic Agent.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df
+
+    def _flatten_prefix(col: str, keys: list[str]) -> None:
+        if col not in out.columns:
+            return
+        ser = out[col]
+        if not ser.map(lambda v: isinstance(v, dict)).any():
+            return
+        base = ser.apply(lambda v: v if isinstance(v, dict) else {})
+        for k in keys:
+            flat_col = f"{col}.{k}"
+            if flat_col not in out.columns or out[flat_col].isna().all():
+                out[flat_col] = base.map(lambda d: d.get(k))
+
+    _flatten_prefix("event", ["code", "outcome", "action", "dataset", "module", "severity"])
+    _flatten_prefix("source", ["ip", "port"])
+    _flatten_prefix("destination", ["ip", "port"])
+    _flatten_prefix("network", ["bytes", "packets", "protocol", "transport"])
+
+    # Normalize ports to numeric to avoid parquet type errors (mixed str/int)
+    for pcol in ["source.port", "destination.port"]:
+        if pcol in out.columns:
+            out[pcol] = pd.to_numeric(out[pcol], errors="coerce")
+
+    return out
+
+
+def add_basic_security_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add base binary flags used by feature engineering and MITRE mapping:
+    - login_failed, conn_suspicious, action_allow, action_deny, ips_alert, cbs_failed
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df
+
+    # login_failed: Windows 4625 OR event.outcome failure OR auth message heuristics (Ubuntu/SSH)
+    msg = out["message"].astype(str) if "message" in out.columns else pd.Series([""] * len(out))
+    msg_l = msg.str.lower()
+    ssh_fail = msg_l.str.contains(r"failed password|authentication failure|invalid user", regex=True, na=False)
+    outcome_fail = out["event.outcome"].astype(str).str.lower().eq("failure") if "event.outcome" in out.columns else False
+    code_4625 = out["event.code"].astype(str).eq("4625") if "event.code" in out.columns else False
+    out["login_failed"] = (code_4625 | outcome_fail | ssh_fail).fillna(False).astype(int)
+
+    # conn_suspicious (demo)
+    dport = pd.to_numeric(out["destination.port"], errors="coerce") if "destination.port" in out.columns else pd.Series([None] * len(out))
+    out["conn_suspicious"] = ((dport == 4444) | (out["event.outcome"].astype(str) == "S0") if "event.outcome" in out.columns else (dport == 4444)).fillna(False).astype(int)
+
+    # Firewall allow/deny flags (real logs: accept/close/allow/permit)
+    action_lower = out["event.action"].astype(str).str.lower() if "event.action" in out.columns else pd.Series([""] * len(out))
+    out["action_allow"] = action_lower.isin(["allow", "allowed", "permit", "accept", "close"]).astype(int)
+    out["action_deny"] = action_lower.isin(["deny", "denied", "drop", "blocked", "reset"]).astype(int)
+
+    # IPS alert flag (Suricata/Snort)
+    out["ips_alert"] = out["event.module"].astype(str).str.lower().eq("ips").astype(int) if "event.module" in out.columns else 0
+
+    # CBS-specific flags from message contents
+    err_re = re.compile(r"(?i)(fail|error|0x[0-9a-f]{2,})")
+    is_cbs = pd.Series([False] * len(out), dtype=bool)
+    if "event.module" in out.columns and "event.dataset" in out.columns:
+        is_cbs = (
+            out["event.module"].astype(str).str.lower().eq("windows")
+            & out["event.dataset"].astype(str).str.lower().eq("cbs")
+        )
+    has_error = msg.str.contains(err_re, na=False)
+    out["cbs_failed"] = (is_cbs & has_error).astype(int)
+
+    return out
+
+
 def _add_rolling_nunique(
     df: pd.DataFrame,
     group_cols: list[str],
@@ -39,7 +121,7 @@ def _add_rolling_nunique(
         colname = f"{prefix}_{w}m"
         try:
             rolled = (
-                idx.groupby(group_cols)[value_col]
+                idx.groupby(group_cols, dropna=False)[value_col]
                 .rolling(f"{w}min")
                 .apply(lambda x: x.dropna().nunique(), raw=False)
                 .reset_index(level=group_cols, drop=True)
@@ -69,7 +151,7 @@ def _add_time_window_sum(
         colname = f"{value_col}_sum_{w}m"
         try:
             rolled = (
-                idx.groupby(group_cols)[value_col]
+                idx.groupby(group_cols, dropna=False)[value_col]
                 .rolling(f"{w}min")
                 .sum()
                 .reset_index(level=group_cols, drop=True)
@@ -141,31 +223,8 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             # Không có timestamp thì bỏ qua ngày này
             continue
 
-        # ------------------------------------------------------------------
-        # Flatten một số trường ECS lồng nhau (Elastic Agent gửi trực tiếp)
-        # ------------------------------------------------------------------
-        # Một số nguồn log (đặc biệt khi ingest trực tiếp từ Elasticsearch)
-        # có trường dạng dict như: event:{action,code,outcome,...},
-        # source:{ip,port}, destination:{ip,port}, network:{bytes,packets,...}.
-        # Đoạn dưới sẽ "trải phẳng" các trường này ra dạng event.code,
-        # source.ip, destination.port... nếu chưa tồn tại.
-
-        def _flatten_prefix(col: str, keys: list[str]) -> None:
-            if col not in ecs.columns:
-                return
-            ser = ecs[col]
-            if not ser.map(lambda v: isinstance(v, dict)).any():
-                return
-            base = ser.apply(lambda v: v if isinstance(v, dict) else {})
-            for k in keys:
-                flat_col = f"{col}.{k}"
-                if flat_col not in ecs.columns or ecs[flat_col].isna().all():
-                    ecs[flat_col] = base.map(lambda d: d.get(k))
-
-        _flatten_prefix("event", ["code", "outcome", "action", "dataset", "module", "severity"])
-        _flatten_prefix("source", ["ip", "port"])
-        _flatten_prefix("destination", ["ip", "port"])
-        _flatten_prefix("network", ["bytes", "packets", "protocol", "transport"])
+        # Flatten nested ECS from Elasticsearch/Elastic Agent (event/source/destination/network dicts)
+        ecs = flatten_ecs_columns(ecs)
 
         # Bổ sung cột thiếu cần thiết cho feature engineering (sau khi flatten)
         required_cols = [
@@ -195,24 +254,8 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             if col not in ecs.columns:
                 ecs[col] = None
 
-        # Event flags
-        ecs["login_failed"] = (
-            (ecs["event.code"].astype(str) == "4625") |
-            (ecs["event.outcome"].astype(str).str.lower() == "failure")
-        ).fillna(False).astype(int)
-
-        ecs["conn_suspicious"] = (
-            (pd.to_numeric(ecs["destination.port"], errors="coerce") == 4444) |
-            (ecs["event.outcome"].astype(str) == "S0")
-        ).fillna(False).astype(int)
-
-        # Firewall allow/deny flags
-        action_lower = ecs["event.action"].astype(str).str.lower()
-        ecs["action_allow"] = action_lower.isin(["allow", "allowed", "permit"]).astype(int)
-        ecs["action_deny"] = action_lower.isin(["deny", "denied", "drop", "blocked", "reset"]).astype(int)
-
-        # IPS alert flag (Suricata/Snort)
-        ecs["ips_alert"] = ecs["event.module"].astype(str).str.lower().eq("ips").astype(int)
+        # Event flags (bruteforce/scan/allow-deny/IPS/CBS)
+        ecs = add_basic_security_flags(ecs)
 
         # Entropy: ưu tiên command_line; nếu thiếu, dùng message (CBS thường không có command_line)
         ecs["process.command_line_entropy"] = ecs["process.command_line"].astype(str).apply(shannon_entropy)
@@ -227,24 +270,7 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
         has_cmd = ecs["process.command_line"].astype(str).str.len() > 0
         ecs["text_entropy"] = ecs["process.command_line_entropy"].where(has_cmd, ecs["message_entropy"])
 
-        # CBS-specific flags from message contents
-        # cbs_failed: dòng có Error/Failed/hex code 0x.. trong CBS
-        err_re = re.compile(r"(?i)(fail|error|0x[0-9a-f]{2,})")
-        
-        # Kiểm tra CBS event (an toàn với cột không tồn tại)
-        is_cbs = pd.Series([False] * len(ecs), dtype=bool)
-        if "event.module" in ecs.columns and "event.dataset" in ecs.columns:
-            is_cbs = (
-                ecs["event.module"].astype(str).str.lower().eq("windows")
-                & ecs["event.dataset"].astype(str).str.lower().eq("cbs")
-            )
-        
-        # Kiểm tra message có chứa error pattern
-        has_error = pd.Series([False] * len(ecs), dtype=bool)
-        if "message" in ecs.columns:
-            has_error = ecs["message"].astype(str).str.contains(err_re, na=False)
-        
-        ecs["cbs_failed"] = (is_cbs & has_error).astype(int)
+        # cbs_failed đã được tính trong add_basic_security_flags()
 
         # Sessionize (an toàn với exception)
         try:
@@ -254,17 +280,34 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             if "session.id" not in ecs.columns:
                 ecs["session.id"] = None
 
-        # Rolling counts theo host và user cho các cờ tổng quát
-        for flag in ["login_failed", "conn_suspicious", "action_deny", "action_allow", "ips_alert"]:
-            ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15])
-            ecs = add_time_window_counts(ecs, ["user.name"], "@timestamp", flag, [1, 5, 15])
-            ecs = add_time_window_counts(ecs, ["source.ip"], "@timestamp", flag, [1, 5, 15])
-            ecs = add_time_window_counts(ecs, ["destination.ip"], "@timestamp", flag, [1, 5, 15])
+        # Canonical entity key for rolling counts:
+        # - Prefer source.ip (network events, bruteforce SSH, scan)
+        # - Fallback user.name (Windows 4625 bruteforce)
+        # - Fallback host.name
+        ecs["_entity_key"] = (
+            ecs.get("source.ip", pd.Series([None] * len(ecs))).astype(str).replace({"None": None, "nan": None})
+        )
+        if "user.name" in ecs.columns:
+            ecs["_entity_key"] = ecs["_entity_key"].where(ecs["_entity_key"].notna(), ecs["user.name"].astype(str))
+        if "host.name" in ecs.columns:
+            ecs["_entity_key"] = ecs["_entity_key"].where(ecs["_entity_key"].notna(), ecs["host.name"].astype(str))
+        ecs["_entity_key"] = ecs["_entity_key"].fillna("unknown")
 
-        # Rolling counts cho CBS theo host và process.name
+        # Rolling counts cho các cờ tổng quát
+        # - Giữ bộ cột "canonical" (không suffix) theo source.ip để phục vụ rule MITRE (vd login_failed_count_5m)
+        # - Đồng thời tạo thêm các biến thể có suffix theo host/user/destination để phân tích sâu hơn
+        for flag in ["login_failed", "conn_suspicious", "action_deny", "action_allow", "ips_alert"]:
+            # Canonical (dùng cho rule/mapping)
+            ecs = add_time_window_counts(ecs, ["_entity_key"], "@timestamp", flag, [1, 5, 15], col_suffix=None)
+            # Extra variants (không phá cột canonical)
+            ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15], col_suffix="host")
+            ecs = add_time_window_counts(ecs, ["user.name"], "@timestamp", flag, [1, 5, 15], col_suffix="user")
+            ecs = add_time_window_counts(ecs, ["destination.ip"], "@timestamp", flag, [1, 5, 15], col_suffix="dst")
+
+        # Rolling counts cho CBS theo host và process.name (đặt suffix để tránh đè lên canonical của group khác)
         for flag in ["cbs_failed"]:
-            ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15])
-            ecs = add_time_window_counts(ecs, ["process.name"], "@timestamp", flag, [1, 5, 15])
+            ecs = add_time_window_counts(ecs, ["host.name"], "@timestamp", flag, [1, 5, 15], col_suffix="host")
+            ecs = add_time_window_counts(ecs, ["process.name"], "@timestamp", flag, [1, 5, 15], col_suffix="proc")
 
         # Unique IP/port rolling metrics (network visibility)
         ecs = _add_rolling_nunique(ecs, ["source.ip"], "@timestamp", "destination.ip", [1, 5, 15], "uniq_dst_per_src")
@@ -307,15 +350,21 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
             "cbs_failed",
         ]
         
-        # Window count features
+        # Window count features (canonical + các biến thể theo host/user/dst)
         window_features = []
         windows = [1, 5, 15]
         flags_for_windowing = ["login_failed", "conn_suspicious", "cbs_failed", "action_allow", "action_deny", "ips_alert"]
         for w in windows:
             for flag in flags_for_windowing:
+                # canonical (source.ip)
                 col = f"{flag}_count_{w}m"
                 if col in ecs.columns:
                     window_features.append(col)
+                # variants
+                for suf in ["host", "user", "dst", "proc"]:
+                    vcol = f"{flag}_count_{suf}_{w}m"
+                    if vcol in ecs.columns:
+                        window_features.append(vcol)
         
         # Ratio & unique metrics
         ratio_features = [c for c in ecs.columns if c.startswith("deny_ratio_")]

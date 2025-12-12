@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import pandas as pd
 
 
@@ -8,6 +8,7 @@ def add_time_window_counts(
     ts_col: str,
     value_col: str,
     windows_min: List[int],
+    col_suffix: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Tính rolling sum cho cờ nhị phân value_col theo group_cols, cửa sổ phút.
@@ -24,17 +25,14 @@ def add_time_window_counts(
     out = out.dropna(subset=[ts_col]).sort_values(ts_col)
     out[value_col] = pd.to_numeric(out[value_col], errors="coerce").fillna(0).astype(int)
 
-    # Dùng hậu tố theo group_cols để tránh trùng tên cột khi cùng một
-    # value_col được window hoá trên nhiều group khác nhau (host.name,
-    # user.name, source.ip, destination.ip, ...).
-    group_suffix = "_".join([c.replace(".", "_") for c in group_cols]) or "all"
-
     idx = out.set_index(ts_col)
     for w in windows_min:
-        colname = f"{value_col}_count_{group_suffix}_{w}m"
+        # Giữ tương thích ngược: nếu không truyền suffix -> <value_col>_count_<w>m
+        colname = f"{value_col}_count_{w}m" if not col_suffix else f"{value_col}_count_{col_suffix}_{w}m"
         try:
             rolled = (
-                idx.groupby(group_cols)[value_col]
+                # dropna=False để không làm giảm kích thước khi group key bị thiếu (NaN)
+                idx.groupby(group_cols, dropna=False)[value_col]
                 .rolling(f"{w}min")
                 .sum()
             )

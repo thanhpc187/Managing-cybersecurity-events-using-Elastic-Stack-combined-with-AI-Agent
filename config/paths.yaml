@@ -11,6 +11,8 @@ elastic_host: http://10.10.20.100:9200
 elastic_user: ""
 elastic_password: ""
 elastic_index_patterns:
+  # Elastic Agent system/auth logs on Ubuntu (brute-force SSH)
+  - "logs-ubuntu.system-*"
   - "lab-logs-network-syslog-*"
   - "siem-*"
 fortigate_syslog_port: 5514

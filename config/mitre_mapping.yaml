@@ -27,7 +27,8 @@
   technique: "T1021"
   conditions:
     destination.port: [22, 3389, 445]
-    event.action: "allow"
+    # Real FW logs có thể là allow/accept/close/permit...
+    event.action: ["allow", "allowed", "permit", "accept", "close"]
 
 - id: rule_lateral_label
   description: "Lateral movement (label fallback)"

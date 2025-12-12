@@ -53,7 +53,7 @@ python -m cli.anom_score ingest --reset
 python -m cli.anom_score ingest \
   --source elasticsearch \
   --elastic-host http://10.10.20.100:9200 \
-  --elastic-index-patterns "lab-logs-network-syslog-*,siem-*"
+  --elastic-index-patterns "logs-ubuntu.system-*,lab-logs-network-syslog-*,siem-*"
 
 # 2. Tạo features
 python -m cli.anom_score featurize --reset
@@ -64,8 +64,15 @@ python -m cli.anom_score train
 # 4. Score anomalies
 python -m cli.anom_score score --reset
 
-# 5. (Tùy chọn) Tạo forensic bundles cho top alerts
-python -m cli.anom_score bundle
+# 5. (Khuyến nghị) Validate nhanh: ECS/Features/Scores/MITRE/NIST có đủ dữ liệu chưa
+# - Tạo file report JSON: data/scores/validate_report.json
+# - Exit code != 0 nếu thiếu field/feature/mapping then chốt
+python -m cli.anom_score validate
+
+# Validate trực tiếp từ Elasticsearch (không cần parquet có sẵn)
+python -m cli.anom_score validate --source elasticsearch \
+  --elastic-host http://10.10.20.100:9200 \
+  --elastic-index-patterns "logs-ubuntu.auth-*,logs-generic-*,logs-network.firewall-*,logs-network.coresw-*,logs-network.accesssw-*"
 
 # 6. (Tùy chọn) Đánh giá mô hình (cần cột label hoặc file nhãn)
 python -m cli.anom_score evaluate --labels-path data/labels/labels.parquet --label-col label
@@ -102,7 +109,7 @@ python -m cli.anom_score ingest --reset
 python -m cli.anom_score featurize --reset
 python -m cli.anom_score train      # Optional: chỉ train nếu muốn retrain
 python -m cli.anom_score score --reset
-python -m cli.anom_score bundle     # Optional
+python -m cli.anom_score validate   # Khuyến nghị
 ```
 
 3. **Reload Streamlit** để xem dữ liệu mới.
