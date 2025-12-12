@@ -135,28 +135,6 @@ def cmd_score(reset: bool = typer.Option(False, help="Remove scores before scori
         logger.error(f"Lỗi khi score: {e}")
         raise typer.Exit(code=1)
 
-@app.command("bundle")
-def cmd_bundle():
-    """Tạo forensic bundle cho top alerts (dựa trên scores.parquet)."""
-    try:
-        from models.utils import get_paths
-        from pipeline.alerting import select_alerts
-        from pipeline.bundle import build_bundles_for_top_alerts
-        paths = get_paths()
-        scores_path = Path(paths["scores_dir"]) / "scores.parquet"
-        if not scores_path.exists():
-            typer.echo(f"[bundle] Không tìm thấy {scores_path}, hãy chạy score trước.")
-            raise typer.Exit(code=1)
-        top, thr = select_alerts(str(scores_path))
-        build_bundles_for_top_alerts(top, thr)
-        typer.echo(f"[bundle] Done. Bundles in {paths['bundles_dir']}")
-    except ImportError as e:
-        logger.error(f"Không thể import bundle pipeline: {e}")
-        raise typer.Exit(code=1)
-    except Exception as e:
-        logger.error(f"Lỗi khi tạo bundle: {e}")
-        raise typer.Exit(code=1)
-
 @app.command("evaluate")
 def cmd_evaluate(
     labels_path: str = typer.Option(None, help="Đường dẫn file nhãn (parquet/csv)"),

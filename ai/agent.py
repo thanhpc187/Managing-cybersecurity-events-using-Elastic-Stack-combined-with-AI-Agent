@@ -695,6 +695,17 @@ def analyze_alert_with_llm(
             "raw_text": "",
             "provider": provider,
             "alert_time": str(safe_get("@timestamp", "N/A")),
+            # Giữ schema đồng nhất với nhánh có LLM
+            "mitre": mitre_hits,
+            "mitre_attack": [],
+            "nist_csf": [],
+            "mitre_llm": mitre_llm,
+            "nist_llm": nist_llm,
+            "mitre_llm_details": mitre_llm_details,
+            "nist_llm_details": nist_llm_details,
+            "llm_mapping_reason": mapping_reason,
+            "correlations": correlations,
+            "markdown": "",
         }
 
     risk = _infer_risk_from_text(text, default="LOW")

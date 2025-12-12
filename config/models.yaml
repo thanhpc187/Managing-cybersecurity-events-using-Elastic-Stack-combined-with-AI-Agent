@@ -7,10 +7,9 @@ isolation_forest:
   n_jobs: -1
 
 scaling:
-  scaler: robust  # options: robust
+  scaler: robust  
 
 scoring:
   top_n: 10
-  # threshold_method: quantile uses (1 - contamination) quantile
   threshold_method: quantile
 
