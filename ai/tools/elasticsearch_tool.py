@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import os
+from urllib.parse import quote
 import requests
 
 from models.utils import load_yaml
@@ -59,18 +60,28 @@ class ElasticsearchTool:
 
     def _index_expr(self, index: str | List[str]) -> str:
         if isinstance(index, list):
-            return ",".join([x for x in index if x])
-        return index
+            expr = ",".join([x for x in index if x])
+        else:
+            expr = index
+        # URL-encode the index expression for safe path usage (keep wildcards, commas)
+        return quote(expr, safe="*,,-_")
 
     def search(self, *, index: str | List[str], query: Dict[str, Any], size: int = 200) -> List[Dict[str, Any]]:
         if not self.host:
             return []
         idx = self._index_expr(index)
-        url = f"{self.host.rstrip('/')}/{idx}/_search"
-        payload = {"size": int(size), "query": query, "sort": [{"@timestamp": {"order": "desc"}}, {"_id": {"order": "desc"}}]}
+        # allow_no_indices avoids hard failure when some patterns don't exist yet
+        url = f"{self.host.rstrip('/')}/{idx}/_search?allow_no_indices=true&ignore_unavailable=true"
+        payload = {
+            "size": int(size),
+            "query": query,
+            "track_total_hits": False,
+            "sort": [{"@timestamp": {"order": "desc"}}, {"_id": {"order": "desc"}}],
+        }
         try:
             resp = requests.post(url, json=payload, auth=self._auth, timeout=self.timeout_sec, verify=self.verify_tls)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                raise ElasticsearchQueryError(f"HTTP {resp.status_code}: {resp.text[:800]}")
             body = resp.json()
         except Exception as e:
             raise ElasticsearchQueryError(f"Elasticsearch search failed: {e}") from e
@@ -98,7 +109,7 @@ class ElasticsearchTool:
         if not self.host:
             return [], {"fetched": 0, "truncated": False, "pages": 0}
         idx = self._index_expr(index)
-        url = f"{self.host.rstrip('/')}/{idx}/_search"
+        url = f"{self.host.rstrip('/')}/{idx}/_search?allow_no_indices=true&ignore_unavailable=true"
         search_after = None
         fetched = 0
         pages = 0
@@ -110,7 +121,8 @@ class ElasticsearchTool:
                 payload["search_after"] = search_after
             try:
                 resp = requests.post(url, json=payload, auth=self._auth, timeout=self.timeout_sec, verify=self.verify_tls)
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    raise ElasticsearchQueryError(f"HTTP {resp.status_code}: {resp.text[:800]}")
                 body = resp.json()
             except Exception as e:
                 raise ElasticsearchQueryError(f"Elasticsearch paged search failed: {e}") from e
@@ -218,13 +230,25 @@ class ElasticsearchTool:
         if not self.index_patterns:
             return [], {"fetched": 0, "truncated": False, "pages": 0}
         query: Dict[str, Any] = {"bool": {"filter": [{"range": {"@timestamp": {"gte": gte, "lte": lte}}}]}}
-        sort = [{"@timestamp": {"order": order}}, {"_id": {"order": order}}]
-        return self.search_after_iter(
-            index=self.index_patterns,
-            query=query,
-            sort=sort,
-            page_size=page_size,
-            max_docs=max_docs,
-        )
+        # Primary: timestamp + _id tiebreaker (recommended if supported)
+        sort_primary = [{"@timestamp": {"order": order}}, {"_id": {"order": order}}]
+        try:
+            return self.search_after_iter(
+                index=self.index_patterns,
+                query=query,
+                sort=sort_primary,
+                page_size=page_size,
+                max_docs=max_docs,
+            )
+        except ElasticsearchQueryError as e:
+            # Some ES setups reject sorting on _id. Fallback to timestamp-only pagination.
+            sort_fallback = [{"@timestamp": {"order": order}}]
+            return self.search_after_iter(
+                index=self.index_patterns,
+                query=query,
+                sort=sort_fallback,
+                page_size=page_size,
+                max_docs=max_docs,
+            )
 
 
