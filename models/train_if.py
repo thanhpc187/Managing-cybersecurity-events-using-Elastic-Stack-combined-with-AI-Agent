@@ -14,6 +14,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 
 from models.utils import get_paths, load_models_config, ensure_dir
+from models.baseline_threshold import baseline_threshold_path
 
 
 MODEL_FILENAME = "isolation_forest.joblib"
@@ -53,6 +54,12 @@ def train_model() -> Path:
 
     model.fit(X_scaled)
 
+    # Baseline threshold (fixed): computed on the same NORMAL training set scores
+    contamination = float(iso_cfg.get("contamination", 0.05))
+    q = 1.0 - contamination
+    train_scores = -model.decision_function(X_scaled)
+    baseline_thr = float(pd.Series(train_scores).quantile(q))
+
     out_dir = Path(paths["models_dir"]).resolve()
     ensure_dir(out_dir)
     model_path = out_dir / MODEL_FILENAME
@@ -63,9 +70,28 @@ def train_model() -> Path:
         "meta": {
             "algorithm": "IsolationForest",
             "params": iso_cfg,
+            "baseline_threshold": baseline_thr,
+            "baseline_threshold_method": f"p{q:.4f}",
         },
     }
     joblib.dump(payload, model_path)
+
+    # Persist baseline threshold to a separate file used by window-report mode
+    bt_path = baseline_threshold_path()
+    bt_obj = {
+        "baseline_threshold": baseline_thr,
+        "method": f"p{q:.4f}",
+        "computed_from": "normal_features (train input)",
+        "created_at": pd.Timestamp.utcnow().isoformat() + "Z",
+        "contamination": contamination,
+    }
+    try:
+        from models.utils import write_json
+
+        write_json(bt_path, bt_obj)
+    except Exception:
+        # Keep training resilient even if threshold file cannot be written
+        pass
     return model_path
 
 

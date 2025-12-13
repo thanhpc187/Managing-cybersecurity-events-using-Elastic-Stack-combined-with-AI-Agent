@@ -6,14 +6,31 @@ See LICENSE file for license information.
 Original repository: https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent
 """
 
-import typer
+try:
+    import typer
+except Exception as e:  # pragma: no cover
+    # Fail-fast with a clear message when dependencies aren't installed (common on a new machine).
+    import sys as _sys
+
+    _sys.stderr.write(
+        "ERROR: Missing CLI dependency 'typer'.\n"
+        "Fix: activate your venv and run: pip install -r requirements.txt\n"
+        f"Details: {e}\n"
+    )
+    raise SystemExit(2)
 import logging
+import os
+import json
 from pathlib import Path
 import shutil
 from typing import Optional, List
 
 app = typer.Typer(help="Loganom AI demo CLI")
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 def _safe_run_ingest(
     source: str = "files",
@@ -175,6 +192,325 @@ def cmd_respond(apply: bool = typer.Option(False, help="Apply actions (otherwise
     except Exception as e:
         logger.error(f"Lỗi khi respond: {e}")
         raise typer.Exit(code=1)
+
+@app.command("agent")
+def cmd_agent(
+    watch: bool = typer.Option(False, help="Chạy dạng watcher: tự chạy khi scores.parquet thay đổi"),
+    interval_sec: int = typer.Option(15, help="Chu kỳ poll khi watch (giây)"),
+    top_n: int = typer.Option(10, help="Số alert (>=threshold) xử lý mỗi lần chạy"),
+    no_bundle: bool = typer.Option(False, help="Không tạo bundle zip (chỉ cập nhật state)"),
+    context_source: str = typer.Option("parquet", help="Nguồn context: parquet | elasticsearch"),
+    elastic_host: str = typer.Option(None, help="Elasticsearch host (vd http://10.10.20.100:9200)"),
+    elastic_index_patterns: str = typer.Option(None, help="Chuỗi phân tách bằng dấu phẩy, vd: logs-ubuntu.auth-*,logs-network.firewall-*"),
+    elastic_user: str = typer.Option(None, help="Elastic username"),
+    elastic_password: str = typer.Option(None, help="Elastic password"),
+):
+    """
+    AI Agent runner:
+    - Trigger tự động (watch): thấy scores.parquet mới/đổi là chạy
+    - Decision loop: tự thu thập thêm context (parquet hoặc Elasticsearch) trước khi phân tích AI trong bundle
+    - Tool-use: query Elasticsearch (tuỳ chọn) để lấy context quanh alert
+    Output:
+    - bundles/alert_*.zip (nếu không --no-bundle)
+    - data/scores/agent_state.json để tránh xử lý trùng
+    """
+    try:
+        from pipeline.agent_runner import run_agent_once, watch_agent
+
+        idx_list = [s.strip() for s in elastic_index_patterns.split(",")] if elastic_index_patterns else None
+        if watch:
+            typer.echo(f"[agent] watch mode: interval={interval_sec}s, top_n={top_n}, context={context_source}")
+            watch_agent(
+                interval_sec=interval_sec,
+                top_n=top_n,
+                build_bundles=not no_bundle,
+                context_source=context_source,
+                elastic_host=elastic_host,
+                elastic_index_patterns=idx_list,
+                elastic_user=elastic_user,
+                elastic_password=elastic_password,
+            )
+        else:
+            res = run_agent_once(
+                top_n=top_n,
+                build_bundles=not no_bundle,
+                context_source=context_source,
+                elastic_host=elastic_host,
+                elastic_index_patterns=idx_list,
+                elastic_user=elastic_user,
+                elastic_password=elastic_password,
+            )
+            typer.echo(
+                f"[agent] processed={res.processed}, skipped={res.skipped}, threshold={res.threshold}, bundles={len(res.bundles)}"
+            )
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        logger.error(f"Lỗi khi chạy agent: {e}")
+        raise typer.Exit(code=1)
+
+@app.command("report")
+def cmd_report(
+    source: str = typer.Option("elasticsearch", help="elasticsearch | parquet"),
+    elastic_host: str = typer.Option(None, help="Elasticsearch host (vd http://10.10.20.100:9200)"),
+    elastic_index_patterns: str = typer.Option(None, help="Chuỗi phân tách bằng dấu phẩy, vd: logs-ubuntu.auth-*,logs-network.firewall-*"),
+    elastic_user: str = typer.Option(None, help="Elastic username"),
+    elastic_password: str = typer.Option(None, help="Elastic password"),
+    window_min: int = typer.Option(15, help="Độ dài window (phút)"),
+    warmup_min: int = typer.Option(60, help="Warmup/lookback để rolling features đúng (phút)"),
+    timezone: str = typer.Option("UTC", help="Timezone cho rounding window và parse start/end (vd UTC hoặc Asia/Ho_Chi_Minh)"),
+    es_page_size: int = typer.Option(1000, help="ES pagination page size (search_after)"),
+    es_max_docs: int = typer.Option(20000, help="Giới hạn tối đa docs fetch từ ES cho mỗi window (WARNING nếu bị truncate)"),
+    watch: bool = typer.Option(False, help="Chạy loop theo interval để tạo report mỗi window"),
+    interval_sec: int = typer.Option(900, help="Chu kỳ chạy khi watch (giây)"),
+    start: str = typer.Option(None, help="Window start ISO, vd 2025-12-13T10:00:00"),
+    end: str = typer.Option(None, help="Window end ISO, vd 2025-12-13T10:15:00"),
+    agent: bool = typer.Option(True, help="Bật AI Agent phân tích alerts (ghi vào folder ai/)"),
+    context_source: str = typer.Option("elasticsearch", help="Nguồn context cho Agent: elasticsearch | parquet"),
+    max_alerts_analyze: int = typer.Option(20, help="Giới hạn số alert gọi Agent/LLM trong 1 window"),
+    output_dir: str = typer.Option(None, help="Thư mục output reports (mặc định data/reports)"),
+):
+    """
+    15-minute window reporting (không retrain):
+    - Dùng model đã có + baseline_threshold cố định từ data/models/baseline_threshold.json
+    - Query dữ liệu theo [window_start - warmup, window_end] nhưng OUTPUT chỉ giữ [window_start, window_end]
+    - Phân loại NORMAL/ANOMALY và lưu lịch sử từng window trong data/reports/
+    """
+    try:
+        from pipeline.window_report import run_report_once, watch_reports
+
+        idx_list = [s.strip() for s in elastic_index_patterns.split(",")] if elastic_index_patterns else None
+        if watch:
+            typer.echo(f"[report] watch mode: window={window_min}m warmup={warmup_min}m interval={interval_sec}s source={source}")
+            watch_reports(
+                window_min=window_min,
+                warmup_min=warmup_min,
+                interval_sec=interval_sec,
+                output_dir=output_dir,
+                source=source,
+                elastic_host=elastic_host,
+                elastic_index_patterns=idx_list,
+                elastic_user=elastic_user,
+                elastic_password=elastic_password,
+                agent=agent,
+                context_source=context_source,
+                max_alerts_analyze=max_alerts_analyze,
+                timezone_name=timezone,
+                es_page_size=es_page_size,
+                es_max_docs=es_max_docs,
+            )
+        else:
+            res = run_report_once(
+                window_min=window_min,
+                warmup_min=warmup_min,
+                start=start,
+                end=end,
+                output_dir=output_dir,
+                source=source,
+                elastic_host=elastic_host,
+                elastic_index_patterns=idx_list,
+                elastic_user=elastic_user,
+                elastic_password=elastic_password,
+                agent=agent,
+                context_source=context_source,
+                max_alerts_analyze=max_alerts_analyze,
+                timezone_name=timezone,
+                es_page_size=es_page_size,
+                es_max_docs=es_max_docs,
+            )
+            typer.echo(f"[report] {res.classification} -> {res.report_dir} (alerts={res.alert_count})")
+            if getattr(res, "validation_failed", False):
+                typer.echo("[report] VALIDATION_FAIL: " + "; ".join(getattr(res, "validation_reasons", []) or []))
+                raise typer.Exit(code=2)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        logger.error(f"Lỗi khi chạy report: {e}")
+        raise typer.Exit(code=1)
+
+@app.command("baseline-threshold")
+def cmd_baseline_threshold(
+    baseline_features_path: str = typer.Option(..., help="Đường dẫn features.parquet của baseline NORMAL (user-provided, known clean)"),
+):
+    """
+    Tạo data/models/baseline_threshold.json từ baseline features do người dùng chỉ định (không retrain).
+    Dùng khi bạn cần tái tạo threshold trên máy mới nhưng vẫn đảm bảo dataset baseline là sạch.
+    """
+    try:
+        from models.baseline_threshold import create_baseline_threshold_from_features, baseline_threshold_path
+
+        out = create_baseline_threshold_from_features(baseline_features_path=Path(baseline_features_path))
+        typer.echo(f"[baseline-threshold] Wrote: {out}")
+        typer.echo(f"[baseline-threshold] Current: {baseline_threshold_path()}")
+    except Exception as e:
+        logger.error(f"Lỗi khi tạo baseline threshold: {e}")
+        raise typer.Exit(code=1)
+
+@app.command("doctor")
+def cmd_doctor(
+    show_env: bool = typer.Option(False, help="In chi tiết biến môi trường quan trọng (ẩn giá trị nhạy cảm)"),
+):
+    """
+    Checklist để chạy ổn định trên máy khác (PASS/FAIL + hướng dẫn fix).
+    Exit codes:
+    - 0: OK
+    - 2: FAIL (thiếu dependency/config/file quan trọng)
+    """
+    import sys
+    from models.utils import get_paths
+
+    paths = get_paths()
+    results: list[tuple[str, bool, str]] = []
+
+    # Python version
+    py_ok = sys.version_info >= (3, 10)
+    results.append(("Python >= 3.10", py_ok, sys.version.split()[0]))
+
+    # Imports (core deps)
+    def _can_import(mod: str) -> bool:
+        try:
+            __import__(mod)
+            return True
+        except Exception:
+            return False
+
+    for mod in ["pandas", "numpy", "pyarrow", "sklearn", "typer", "yaml", "requests", "streamlit"]:
+        results.append((f"import {mod}", _can_import(mod), ""))
+
+    # Output dirs writable
+    def _writable_dir(p: str) -> bool:
+        try:
+            pp = Path(p)
+            pp.mkdir(parents=True, exist_ok=True)
+            t = pp / ".write_test"
+            t.write_text("ok", encoding="utf-8")
+            t.unlink(missing_ok=True)
+            return True
+        except Exception:
+            return False
+
+    for k in ["ecs_parquet_dir", "features_dir", "scores_dir", "models_dir", "reports_dir", "bundles_dir"]:
+        v = paths.get(k)
+        if isinstance(v, str):
+            results.append((f"Writable {k}", _writable_dir(v), v))
+
+    # Model + baseline threshold files
+    model_path = Path(paths["models_dir"]) / "isolation_forest.joblib"
+    results.append(("Model exists (isolation_forest.joblib)", model_path.exists(), str(model_path)))
+    bt_path = Path(paths["models_dir"]) / "baseline_threshold.json"
+    # Allow fallback from model meta, but warn if file missing
+    bt_ok = bt_path.exists()
+    if not bt_ok:
+        try:
+            from models.baseline_threshold import load_baseline_threshold_from_model_meta
+
+            bt_ok = load_baseline_threshold_from_model_meta() is not None
+        except Exception:
+            bt_ok = False
+    results.append(("Baseline threshold available (baseline_threshold.json or model meta)", bt_ok, str(bt_path)))
+
+    # Env keys
+    env_keys = ["GEMINI_API_KEY", "DEEPSEEK_API_KEY", "ELASTIC_HOST", "ELASTIC_USER", "ELASTIC_PASSWORD", "ELASTIC_VERIFY"]
+    if show_env:
+        for k in env_keys:
+            val = os.getenv(k)
+            masked = ""
+            if val:
+                masked = (val[:3] + "***") if len(val) > 6 else "***"
+            results.append((f"ENV {k}", bool(val), masked))
+    else:
+        for k in env_keys:
+            results.append((f"ENV {k}", bool(os.getenv(k)), ""))
+
+    failed = [r for r in results if not r[1]]
+    typer.echo("=== DOCTOR CHECKLIST ===")
+    for name, ok, detail in results:
+        status = "PASS" if ok else "FAIL"
+        msg = f"{status} - {name}"
+        if detail:
+            msg += f" ({detail})"
+        typer.echo(msg)
+
+    if failed:
+        typer.echo("\nHướng dẫn fix nhanh:")
+        typer.echo("- Cài deps: pip install -r requirements.txt")
+        typer.echo("- Copy baseline files: data/models/isolation_forest.joblib và data/models/baseline_threshold.json")
+        typer.echo("- Nếu chạy ES: set --elastic-host/--elastic-index-patterns hoặc cấu hình config/paths.yaml")
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=0)
+
+
+@app.command("smoke")
+def cmd_smoke():
+    """
+    Smoke test chạy nhanh (không cần ES):
+    - chạy doctor
+    - tạo ECS parquet nhỏ tạm thời
+    - chạy report 1 window từ parquet
+    - kiểm tra report folder và report.json schema
+    """
+    from models.utils import get_paths
+    from pipeline.window_report import run_report_once, assert_report_schema
+
+    # Doctor (raise Exit)
+    try:
+        cmd_doctor(show_env=False)
+    except typer.Exit as e:
+        if e.exit_code != 0:
+            raise
+
+    paths = get_paths()
+    model_path = Path(paths["models_dir"]) / "isolation_forest.joblib"
+    bt_path = Path(paths["models_dir"]) / "baseline_threshold.json"
+    if not model_path.exists():
+        typer.echo("[smoke] Missing model; cannot run report. Copy baseline model first.")
+        raise typer.Exit(code=2)
+    if not bt_path.exists():
+        typer.echo("[smoke] Missing baseline_threshold.json; copy it (recommended) or ensure model meta contains baseline_threshold.")
+
+    # Create temp ECS parquet
+    import tempfile
+    from datetime import datetime, timezone
+    import pandas as pd
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_ecs = Path(tmp) / "ecs_parquet"
+        tmp_reports = Path(tmp) / "reports"
+        tmp_ecs.mkdir(parents=True, exist_ok=True)
+        tmp_reports.mkdir(parents=True, exist_ok=True)
+        os.environ["ECS_PARQUET_DIR"] = str(tmp_ecs)
+        os.environ["REPORTS_DIR"] = str(tmp_reports)
+
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        rows = [
+            {"@timestamp": (now).isoformat(), "message": "Failed password for invalid user test", "event": {"outcome": "failure"}, "source": {"ip": "1.2.3.4"}, "destination": {"ip": "10.0.0.1", "port": 22}, "event.action": "deny"},
+            {"@timestamp": (now).isoformat(), "message": "Accepted password", "event.action": "accept", "source.ip": "1.2.3.4", "destination.ip": "10.0.0.1", "destination.port": 22},
+        ]
+        df = pd.DataFrame(rows)
+        (tmp_ecs / "elastic").mkdir(parents=True, exist_ok=True)
+        df.to_parquet(tmp_ecs / "elastic" / "dt=2025-01-01" / "part.parquet", index=False)
+
+        # Run report from parquet for a fixed window
+        res = run_report_once(
+            window_min=15,
+            warmup_min=60,
+            start="2025-01-01T00:00:00",
+            end="2025-01-01T00:15:00",
+            output_dir=str(tmp_reports),
+            source="parquet",
+            agent=False,
+            timezone_name="UTC",
+        )
+
+        rj = res.report_dir / "report.json"
+        if not rj.exists():
+            typer.echo("[smoke] report.json missing")
+            raise typer.Exit(code=2)
+        with open(rj, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        assert_report_schema(obj)
+        typer.echo(f"[smoke] OK: {res.report_dir}")
+    raise typer.Exit(code=0)
 
 @app.command("validate")
 def cmd_validate(

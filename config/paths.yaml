@@ -4,6 +4,7 @@ ecs_parquet_dir: data/ecs_parquet
 features_dir: data/features
 models_dir: data/models
 scores_dir: data/scores
+reports_dir: data/reports
 bundles_dir: bundles
 logs_dir: data/logs
 # Network / ingestion endpoints

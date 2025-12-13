@@ -13,7 +13,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.utils import get_paths  # noqa: E402
-from explain.thresholding import compute_threshold  # noqa: E402
 from ai.mitre_mapper import load_mitre_mapping, map_to_mitre  # noqa: E402
 from ai.nist_mapper import load_nist_mapping, map_to_nist  # noqa: E402
 
@@ -23,24 +22,61 @@ st.title("📊 Báo cáo kết quả SIEM + AI Agent (One-page)")
 
 
 # ---------------------------------------------------------
-# Load data
+# Load window report (data/reports/*/report_*/)
 # ---------------------------------------------------------
 paths = get_paths()
-scores_path = Path(paths["scores_dir"]) / "scores.parquet"
-eval_report_path = Path(paths["scores_dir"]) / "evaluate_report.json"
+reports_root = Path(paths.get("reports_dir") or (Path(paths["scores_dir"]).resolve().parents[0] / "reports")).resolve()
+normal_root = reports_root / "NORMAL"
+anom_root = reports_root / "ANOMALY"
 
-if not scores_path.exists():
-    st.warning("Chưa có dữ liệu scores. Hãy chạy ingest → featurize → train → score trước.")
+def _list_reports() -> list[Path]:
+    out: list[Path] = []
+    for base in (anom_root, normal_root):
+        if base.exists():
+            out.extend([p for p in base.glob("report_*") if p.is_dir()])
+    # newest first by folder name timestamp
+    return sorted(out, reverse=True)
+
+report_dirs = _list_reports()
+if not report_dirs:
+    st.warning("Chưa có báo cáo theo window. Hãy chạy: python -m cli.anom_score report")
     st.stop()
 
-df = pd.read_parquet(scores_path)
+opts = [p.relative_to(reports_root).as_posix() for p in report_dirs]
+sel = st.selectbox("Chọn window report", opts, index=0)
+report_dir = reports_root / sel
+
+report_json_path = report_dir / "report.json"
+scores_path = report_dir / "scores_window.parquet"
+alerts_path = report_dir / "alerts.parquet"
+
+try:
+    if not report_json_path.exists():
+        st.error(f"Thiếu report.json trong {report_dir}")
+        st.stop()
+    with open(report_json_path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+except Exception as e:
+    st.error(f"Không đọc được report.json: {e}")
+    st.stop()
+
+try:
+    scores_df = pd.read_parquet(scores_path) if scores_path.exists() else pd.DataFrame()
+except Exception as e:
+    st.error(f"Không đọc được scores_window.parquet: {e}")
+    scores_df = pd.DataFrame()
+try:
+    alerts = pd.read_parquet(alerts_path) if alerts_path.exists() else pd.DataFrame()
+except Exception as e:
+    st.error(f"Không đọc được alerts.parquet: {e}")
+    alerts = pd.DataFrame()
+df = scores_df.copy()
 if "@timestamp" in df.columns:
     df["@timestamp"] = pd.to_datetime(df["@timestamp"], utc=True, errors="coerce")
     df = df.dropna(subset=["@timestamp"]).sort_values("@timestamp")
-
-# Threshold & alerts
-thr, _ = compute_threshold(df["anom.score"]) if "anom.score" in df.columns and len(df) else (None, 0)
-alerts = df[df["anom.score"] >= thr].copy() if thr is not None else df.head(0)
+if "@timestamp" in alerts.columns:
+    alerts["@timestamp"] = pd.to_datetime(alerts["@timestamp"], utc=True, errors="coerce")
+    alerts = alerts.dropna(subset=["@timestamp"]).sort_values("@timestamp")
 
 # Recompute MITRE + NIST mapping
 mapping_cfg = load_mitre_mapping()
@@ -179,9 +215,14 @@ def summarize_report_with_gemini(payload: dict):
 # ---------------------------------------------------------
 st.subheader("Tổng quan dữ liệu")
 c1, c2, c3 = st.columns(3)
-c1.metric("Tổng log (scores)", f"{len(df):,}")
-c2.metric("Alerts ≥ threshold", f"{len(alerts):,}")
-c3.metric("Ngưỡng (quantile)", f"{thr:.4f}" if thr is not None else "n/a")
+c1.metric("Classification", report.get("classification", "N/A"))
+c2.metric("Window", f"{report.get('window_start','')} → {report.get('window_end','')}")
+c3.metric("Baseline threshold", f"{float(report.get('baseline_threshold', 0.0)):.6f}")
+
+c4, c5, c6 = st.columns(3)
+c4.metric("Total events ingested", f"{int(report.get('total_events_ingested', 0)):,}")
+c5.metric("Total rows scored", f"{int(report.get('total_rows_scored', 0)):,}")
+c6.metric("Alert count", f"{int(report.get('alert_count', 0)):,}")
 
 st.caption("Nguồn log đã ingest (event.module / event.dataset)")
 src_cols = []
@@ -200,11 +241,14 @@ else:
 # ---------------------------------------------------------
 st.subheader("Kết luận tổng quan")
 summary_payload = {
-    "total_events": len(df),
-    "alert_count": len(alerts),
-    "threshold": thr,
-    "risk_counts": alerts["risk_level"].value_counts(dropna=False).to_dict(),
-    "mitre_techniques": [x["id"] for x in _collect_mitre_techniques(alerts)],
+    "classification": report.get("classification"),
+    "window_start": report.get("window_start"),
+    "window_end": report.get("window_end"),
+    "total_events": int(report.get("total_events_ingested", 0)),
+    "alert_count": int(report.get("alert_count", 0)),
+    "baseline_threshold": float(report.get("baseline_threshold", 0.0)),
+    "risk_counts": report.get("risk_distribution", {}),
+    "mitre_techniques": list((report.get("mitre_counts") or {}).keys()),
     "nist_functions": alerts.get("nist.functions", pd.Series([], dtype=str)).value_counts().to_dict()
     if "nist.functions" in alerts.columns
     else {},
@@ -225,35 +269,19 @@ else:
             st.session_state["report_summary_ai"] = summarize_report_with_gemini(summary_payload)
         st.markdown(st.session_state["report_summary_ai"])
 
-# ---------------------------------------------------------
-# 3) Chỉ số phát hiện (nếu có evaluate_report.json)
-# ---------------------------------------------------------
-st.subheader("Chỉ số phát hiện (Precision/Recall/F1/TPR/FPR/MTTD/MTTR)")
-if eval_report_path.exists():
-    with open(eval_report_path, "r", encoding="utf-8") as f:
-        report = json.load(f)
-    metrics = report.get("metrics", {})
-    counts = report.get("counts", {})
-    mcols = st.columns(5)
-    mcols[0].metric("Precision", f"{metrics.get('Precision', 0):.3f}")
-    mcols[1].metric("Recall/TPR", f"{metrics.get('Recall', 0):.3f}")
-    mcols[2].metric("F1", f"{metrics.get('F1', 0):.3f}")
-    mcols[3].metric("FPR", f"{metrics.get('FPR', 0):.3f}")
-    mcols[4].metric("TPR", f"{metrics.get('TPR', 0):.3f}")
-    st.caption(f"Dataset: total={counts.get('total', 0)}, positive={counts.get('positive', 0)}, negative={counts.get('negative', 0)}")
-else:
-    st.info("Chưa có evaluate_report.json (chưa đánh giá bằng nhãn).")
+# (Ẩn) Chỉ số phát hiện:
 
 # ---------------------------------------------------------
 # 4) Phân phối rủi ro & anom.score
 # ---------------------------------------------------------
 st.subheader("Phân phối rủi ro")
-risk_counts = alerts["risk_level"].value_counts(dropna=False)
+risk_counts = pd.Series(report.get("risk_distribution", {"LOW": 0, "MEDIUM": 0, "HIGH": 0}))
 st.bar_chart(risk_counts)
 
 st.subheader("Phân phối anom.score (histogram)")
 fig_hist, ax_hist = plt.subplots(figsize=(6, 3))
-ax_hist.hist(df["anom.score"], bins=30, color="#3b82f6", alpha=0.8)
+if "anom.score" in df.columns and len(df):
+    ax_hist.hist(df["anom.score"], bins=30, color="#3b82f6", alpha=0.8)
 ax_hist.set_xlabel("anom.score")
 ax_hist.set_ylabel("Count")
 st.pyplot(fig_hist)
@@ -331,9 +359,9 @@ else:
 # 6) Timeline alert
 # ---------------------------------------------------------
 st.subheader("Timeline alert")
-if not alerts.empty:
+if not alerts.empty and "@timestamp" in alerts.columns:
     alerts_ts = alerts.set_index("@timestamp").sort_index()
-    line = alerts_ts["anom.score"].resample("1min").count()
+    line = alerts_ts["anom.score"].resample("1min").count() if "anom.score" in alerts_ts.columns else alerts_ts.resample("1min").size()
     fig_tl, ax_tl = plt.subplots(figsize=(10, 3))
     ax_tl.plot(line.index, line.values, linewidth=1)
     ax_tl.set_ylabel("Alerts per minute")
@@ -383,4 +411,4 @@ cols_show = [
 ]
 st.dataframe(df_view[cols_show].sort_values("@timestamp"), use_container_width=True, hide_index=True)
 
-st.caption("Chạy pipeline ingest → featurize → train → score để cập nhật báo cáo.")
+# (Ẩn) Chú thích cuối trang: đã được yêu cầu ẩn khỏi giao diện

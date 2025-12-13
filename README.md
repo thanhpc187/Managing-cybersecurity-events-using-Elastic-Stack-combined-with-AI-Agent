@@ -84,6 +84,110 @@ Sau khi pipeline hoàn tất, chạy UI:
 streamlit run ui/streamlit_app.py
 ```
 
+## 🤖 AI Agent mode (Trigger + Decision loop + Tool use)
+
+Dự án có chế độ Agent để tự xử lý khi có alert mới:
+
+```bash
+# Chạy 1 lần: xử lý top alerts (>= threshold), tạo bundle + ai_analysis.*
+python -m cli.anom_score agent
+
+# Chạy liên tục (trigger tự động): khi scores.parquet thay đổi sẽ tự chạy lại
+python -m cli.anom_score agent --watch --interval-sec 15
+```
+
+### Tool-use: lấy context trực tiếp từ Elasticsearch (tuỳ chọn)
+
+Agent có thể query Elasticsearch để lấy log liên quan quanh alert (± thời gian, theo src/dst/user/host):
+
+```bash
+python -m cli.anom_score agent --context-source elasticsearch \
+  --elastic-host http://10.10.20.100:9200 \
+  --elastic-index-patterns "logs-ubuntu.auth-*,logs-generic-*,logs-network.firewall-*,siem-*"
+```
+
+Ghi chú:
+- Kết quả phân tích sẽ nằm trong `bundles/alert_*.zip` (kèm `ai_analysis.json` và `ai_analysis.md`).
+- Trạng thái tránh chạy lại sẽ lưu tại `data/scores/agent_state.json`.
+
+## 🕒 15-minute Window Reporting (NORMAL/ANOMALY) – không retrain
+
+Chế độ này **không retrain**. Nó dùng:
+- Model đã có: `data/models/isolation_forest.joblib`
+- Threshold cố định baseline: `data/models/baseline_threshold.json`
+
+Chạy 1 lần (window gần nhất, end được làm tròn theo bội số 15 phút):
+
+```bash
+python -m cli.anom_score report
+```
+
+Chạy loop (mỗi interval sinh 1 report folder, tránh chạy trùng bằng `data/reports/report_state.json`):
+
+```bash
+python -m cli.anom_score report --watch --interval-sec 900
+```
+
+Query Elasticsearch (kèm warmup/lookback để rolling features đúng):
+
+```bash
+python -m cli.anom_score report --source elasticsearch \
+  --elastic-host http://10.10.20.100:9200 \
+  --elastic-index-patterns "logs-ubuntu.auth-*,logs-generic-*,logs-network.firewall-*,siem-*" \
+  --window-min 15 --warmup-min 60
+```
+
+Output mỗi window:
+- `data/reports/ANOMALY/report_YYYYMMDD_HHMM/` hoặc `data/reports/NORMAL/report_YYYYMMDD_HHMM/`
+- Bên trong có: `report.json`, `report.md`, `ecs_window.parquet`, `features_window.parquet`, `scores_window.parquet`, `alerts.parquet`, `validate_window.json`, và folder `ai/` (nếu bật agent).
+
+## 🚚 Chạy trên máy khác (Machine B) – 3 lệnh tối đa
+
+### 1) Copy project + baseline artifacts
+- Copy toàn bộ source code.
+- Copy **bắt buộc**:
+  - `data/models/isolation_forest.joblib`
+  - `data/models/baseline_threshold.json` (khuyến nghị bắt buộc để tránh fallback)
+
+### 2) Cài dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3) Cấu hình ES + paths (ENV hoặc config)
+
+Khuyến nghị dùng ENV (portable, không sửa code):
+- `ELASTIC_HOST` (vd `http://10.10.20.100:9200`)
+- `ELASTIC_USER`, `ELASTIC_PASSWORD` (nếu có)
+- `ELASTIC_VERIFY` (`true/false`, default true)
+- `MODELS_DIR` (nếu bạn đặt model ở nơi khác)
+- `REPORTS_DIR` (nếu muốn ghi reports vào nơi khác)
+
+### 4) Runbook 3 lệnh
+
+```bash
+# 1) Kiểm tra môi trường (PASS/FAIL + hướng dẫn fix)
+python -m cli.anom_score doctor
+
+# 2) Sinh report window gần nhất (không retrain)
+python -m cli.anom_score report --source elasticsearch \
+  --elastic-host http://10.10.20.100:9200 \
+  --elastic-index-patterns "logs-ubuntu.system-*,lab-logs-network-syslog-*,siem-*" \
+  --window-min 15 --warmup-min 60 --timezone UTC
+
+# 3) Xem báo cáo
+streamlit run ui/streamlit_app.py
+```
+
+Ghi chú:
+- Nếu `baseline_threshold.json` bị thiếu, report mode chỉ fallback được khi trong model meta có `baseline_threshold`; nếu không sẽ báo lỗi và dừng.
+- Nếu bạn cần *tạo lại* baseline_threshold trên máy mới (chỉ khi bạn chắc chắn baseline features là sạch):
+
+```bash
+python -m cli.anom_score baseline-threshold --baseline-features-path <path_to_clean_baseline_features.parquet>
+```
+
 ## MITRE ATT&CK & NIST CSF 2.0 Mapping
 
 - Rule MITRE cấu hình tại `config/mitre_mapping.yaml` (ví dụ: brute force T1110, remote service T1021, port scan T1046).
