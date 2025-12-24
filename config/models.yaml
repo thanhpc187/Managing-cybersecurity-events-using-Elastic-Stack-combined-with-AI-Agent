@@ -1,4 +1,3 @@
-# Isolation Forest hyperparameters and scoring configs
 isolation_forest:
   n_estimators: 150
   max_samples: auto

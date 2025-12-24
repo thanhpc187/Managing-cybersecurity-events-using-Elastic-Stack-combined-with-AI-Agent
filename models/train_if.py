@@ -28,9 +28,26 @@ def train_model() -> Path:
     if df.empty:
         raise RuntimeError("Feature table is empty; run featurize first")
 
-    # Select feature columns (anything numeric not in identity)
-    id_cols = {"@timestamp", "host.name", "user.name", "source.ip", "destination.ip", "session.id"}
-    feature_cols = [c for c in df.columns if c not in id_cols and pd.api.types.is_numeric_dtype(df[c])]
+    # Select feature columns (numeric only) and avoid training leakage on IDs/labels.
+    id_cols = {
+        "@timestamp",
+        "host.name",
+        "user.name",
+        "source.ip",
+        "source.port",
+        "destination.ip",
+        "destination.port",
+        "session.id",
+        # labels.* should never be used for unsupervised training
+        "labels.is_attack",
+    }
+    feature_cols = [
+        c
+        for c in df.columns
+        if c not in id_cols
+        and not str(c).startswith("labels.")
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
 
     # Drop constant/zero-variance columns to avoid misleading SHAP and improve CBS-only training
     X_all = df[feature_cols].fillna(0.0)

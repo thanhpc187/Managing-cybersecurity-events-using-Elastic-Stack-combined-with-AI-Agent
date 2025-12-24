@@ -111,6 +111,41 @@ def parse_auth_logs(root: Path = Path("sample_data")) -> Path:
                             uo = USER_OK_RE.search(msg)
                             if uo:
                                 user = uo.group("user")
+
+                        # Re-tag Cisco-like switch/syslog events so they appear as network device logs
+                        # Example messages:
+                        #   %LINK-3-UPDOWN: Interface Ethernet0/3, changed state to down
+                        #   %LINEPROTO-5-UPDOWN: Line protocol on Interface Ethernet0/3, changed state to down
+                        #   %SYS-5-CONFIG_I: Configured from console by vty0
+                        msg_u = msg.upper()
+                        proc_u = (proc or "").upper()
+                        is_auth = (
+                            ("sshd" in (proc or "").lower())
+                            or ("Failed password" in msg)
+                            or ("Accepted " in msg)
+                            or ("authentication failure" in msg)
+                        )
+                        is_switch = any(
+                            x in msg_u or x in proc_u
+                            for x in ["%LINK-", "%LINEPROTO-", "%SYS-", "%CONFIG_I", "%SEC-"]
+                        )
+
+                        event_module = "syslog"
+                        event_dataset = "auth"
+                        event_action = "user_login"
+                        event_outcome = outcome
+                        if (not is_auth) and is_switch:
+                            event_module = "network"
+                            event_dataset = "switch.syslog"
+                            if "UPDOWN" in msg_u:
+                                event_action = "interface_state"
+                                event_outcome = "info"
+                            elif "CONFIG" in msg_u:
+                                event_action = "config_change"
+                                event_outcome = "info"
+                            else:
+                                event_action = "syslog_event"
+                                event_outcome = "info"
                         ip = None
                         ipm = IP_RE.search(msg)
                         if ipm:
@@ -121,10 +156,10 @@ def parse_auth_logs(root: Path = Path("sample_data")) -> Path:
                             "host.name": gd.get("host"),
                             "process.name": proc,
                             "message": msg,
-                            "event.module": "syslog",
-                            "event.dataset": "auth",
-                            "event.action": "user_login",
-                            "event.outcome": outcome,
+                            "event.module": event_module,
+                            "event.dataset": event_dataset,
+                            "event.action": event_action,
+                            "event.outcome": event_outcome,
                             "user.name": user,
                             "source.ip": ip,
                             "log.file.path": str(p),

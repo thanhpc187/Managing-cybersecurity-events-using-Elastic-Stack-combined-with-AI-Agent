@@ -71,6 +71,9 @@ fortigate:
     dstport: "destination.port"
     proto: "network.transport"
     action: "event.action"
+    # Optional: allow synthetic / enriched FortiGate records to carry outcome
+    # (used to trigger conn_suspicious for port-scan demo)
+    outcome: "event.outcome"
     policyid: "rule.id"
     service: "network.protocol"
     msg: "message"

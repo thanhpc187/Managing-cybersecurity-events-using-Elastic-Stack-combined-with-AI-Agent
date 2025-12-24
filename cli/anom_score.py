@@ -524,5 +524,66 @@ def cmd_demo(reset: bool = typer.Option(False, help="Reset ecs/features/scores/b
     cmd_train()
     cmd_score(reset=False)
 
+
+@app.command("session")
+def cmd_session(
+    elastic_host: str = typer.Option(None, help="Elasticsearch host (vd http://10.10.20.100:9200)"),
+    elastic_index_patterns: str = typer.Option(
+        None,
+        help="Chuỗi phân tách bằng dấu phẩy, vd: logs-ubuntu.auth-*,logs-network.firewall-*",
+    ),
+    elastic_user: str = typer.Option(None, help="Elastic username"),
+    elastic_password: str = typer.Option(None, help="Elastic password"),
+    verify_tls: bool = typer.Option(False, help="Verify TLS certificate when querying Elasticsearch"),
+    baseline_start: str = typer.Option(None, help="ISO start time for baseline clean logs (vd 2025-12-01T00:00:00Z)"),
+    baseline_end: str = typer.Option(None, help="ISO end time for baseline clean logs (vd 2025-12-03T00:00:00Z)"),
+    baseline_lookback_hours: int = typer.Option(72, help="If baseline_start/end not set, use now-lookback_hours..now"),
+    window_minutes: int = typer.Option(10, help="Window size in minutes (default 10)"),
+    warmup_minutes: int = typer.Option(20, help="Warmup minutes to fetch before each window (>= rolling max, default 20)"),
+    work_hours: int = typer.Option(8, help="Session duration in hours (default 8 => 48 windows for 10m)"),
+    page_size: int = typer.Option(2000, help="Elasticsearch page size for search_after"),
+    max_docs_per_window: int = typer.Option(200000, help="Hard cap docs fetched per window (safety)"),
+):
+    """
+    Chạy 1 lệnh cho cả "phiên làm việc":
+    - Mỗi ngày chạy 1 lần: retrain 1 lần ở đầu phiên (baseline + NORMAL windows tích luỹ)
+    - Sau đó tự động ingest theo cửa sổ 10 phút (mặc định) trong 8 giờ
+    - Phân loại NORMAL/ANOMALY và lưu đủ artifacts để retrain ngày hôm sau
+    """
+    from models.utils import load_yaml, CONFIG_DIR
+    from pipeline.session_runner import run_session
+
+    cfg = load_yaml(CONFIG_DIR / "paths.yaml")
+    host = elastic_host or cfg.get("elastic_host")
+    if not host:
+        typer.echo("[session] ERROR: elastic_host is required (or set in config/paths.yaml)")
+        raise typer.Exit(code=2)
+
+    if elastic_index_patterns:
+        patterns = [s.strip() for s in elastic_index_patterns.split(",") if s.strip()]
+    else:
+        patterns = cfg.get("elastic_index_patterns") or []
+
+    if not patterns:
+        typer.echo("[session] ERROR: elastic_index_patterns is required (or set in config/paths.yaml)")
+        raise typer.Exit(code=2)
+
+    out = run_session(
+        elastic_host=host,
+        elastic_index_patterns=patterns,
+        elastic_user=elastic_user or cfg.get("elastic_user") or None,
+        elastic_password=elastic_password or cfg.get("elastic_password") or None,
+        verify_tls=verify_tls,
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        baseline_lookback_hours=int(baseline_lookback_hours),
+        window_minutes=int(window_minutes),
+        warmup_minutes=int(warmup_minutes),
+        work_hours=int(work_hours),
+        page_size=int(page_size),
+        max_docs_per_window=int(max_docs_per_window),
+    )
+    typer.echo(f"[session] Done. Windows stored under: {out}")
+
 if __name__ == "__main__":
     app()

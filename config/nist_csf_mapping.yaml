@@ -1,6 +1,3 @@
-# NIST CSF 2.0 mapping rules (nhẹ, dựa trên kỹ thuật MITRE đã phát hiện)
-# Mỗi rule gồm: id, description, function, category, subcategory (optional), techniques (list MITRE IDs)
-
 - id: nist_detect_bruteforce
   description: "Phát hiện brute force đăng nhập"
   function: "DETECT"

@@ -101,3 +101,22 @@ def score_features_large() -> Path:
         merged.to_parquet(scores_root / "scores.parquet", index=False)
 
     return scores_root
+
+
+def score_feature_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Score an in-memory feature dataframe using the saved model payload.
+
+    Returns a copy of df with an added column: anom.score
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    model, scaler, feature_cols = _load_model()
+    X = _prepare_features(df, feature_cols)
+    X_np = X.values
+    if scaler is not None:
+        X_np = scaler.transform(X_np)
+    scores = -model.decision_function(X_np)
+    out = df.copy()
+    out["anom.score"] = scores
+    return out

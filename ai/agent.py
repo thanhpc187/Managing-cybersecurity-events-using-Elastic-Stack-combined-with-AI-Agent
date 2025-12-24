@@ -1,7 +1,4 @@
 """
-AI agent phân tích alert bằng LLM (tiếng Việt).
-Ưu tiên: DeepSeek -> Gemini -> Offline stub.
-
 Copyright (c) 2024 thanhpc187
 See LICENSE file for license information.
 Original repository: https://github.com/thanhpc187/Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent

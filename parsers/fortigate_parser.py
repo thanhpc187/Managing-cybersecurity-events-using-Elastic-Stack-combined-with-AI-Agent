@@ -1,12 +1,3 @@
-"""
-Parser cho FortiGate syslog (UDP 5514 hoặc file log) -> ECS Parquet.
-
-Hỗ trợ định dạng key=value phổ biến của FortiGate:
-date=2024-08-01 time=12:34:56 devname=FGT1 devid=FGT001 logid="..." type=traffic subtype=forward
-level=notice srcip=10.0.0.10 srcport=12345 dstip=8.8.8.8 dstport=53 proto=udp action=deny policyid=3 service=DNS
-msg="..."; sentbyte=120 rcvdbyte=40
-"""
-
 from __future__ import annotations
 
 import re

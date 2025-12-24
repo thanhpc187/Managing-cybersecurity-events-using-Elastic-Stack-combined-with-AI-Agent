@@ -425,3 +425,200 @@ def build_feature_table_large(sample_per_day: int = 100_000) -> Path:
 def build_feature_table() -> Path:
     """Wrapper để CLI gọi; mặc định dùng large-mode."""
     return build_feature_table_large()
+
+
+def build_features_from_ecs_df(
+    ecs: pd.DataFrame,
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
+) -> pd.DataFrame:
+    """
+    Build features from an in-memory ECS dataframe.
+
+    This is used for "window processing" (e.g., every 10 minutes):
+    - You may fetch extra warmup events before window_start so rolling windows are correct.
+    - After building features, this function can slice to [window_start, window_end].
+
+    Args:
+        ecs: ECS-like dataframe, ideally already containing @timestamp and ECS columns.
+        window_start/window_end: optional ISO timestamps to slice output rows.
+    Returns:
+        Feature dataframe with id columns + engineered numeric features.
+    """
+    if ecs is None or ecs.empty:
+        return pd.DataFrame()
+
+    out = ecs.copy()
+
+    # Timestamp normalization
+    if "@timestamp" not in out.columns:
+        return pd.DataFrame()
+    out["@timestamp"] = pd.to_datetime(out["@timestamp"], utc=True, errors="coerce")
+    out = out.dropna(subset=["@timestamp"]).sort_values("@timestamp")
+    if out.empty:
+        return pd.DataFrame()
+
+    # Flatten nested ECS (common when ingesting from Elasticsearch)
+    out = flatten_ecs_columns(out)
+
+    # Ensure required columns exist (after flatten)
+    required_cols = [
+        "event.code",
+        "event.outcome",
+        "event.action",
+        "event.module",
+        "event.dataset",
+        "event.severity",
+        "destination.port",
+        "network.protocol",
+        "network.transport",
+        "process.command_line",
+        "process.name",
+        "host.name",
+        "user.name",
+        "source.ip",
+        "source.port",
+        "destination.ip",
+        "network.bytes",
+        "network.packets",
+        "rule.id",
+        "labels.is_attack",
+        "labels.attack_type",
+    ]
+    for col in required_cols:
+        if col not in out.columns:
+            out[col] = None
+
+    # Flags
+    out = add_basic_security_flags(out)
+
+    # Entropy
+    out["process.command_line_entropy"] = out["process.command_line"].astype(str).apply(shannon_entropy)
+    if "message" in out.columns:
+        out["message_entropy"] = out["message"].astype(str).apply(shannon_entropy)
+    else:
+        out["message_entropy"] = 0.0
+    has_cmd = out["process.command_line"].astype(str).str.len() > 0
+    out["text_entropy"] = out["process.command_line_entropy"].where(has_cmd, out["message_entropy"])
+
+    # Sessionize (best-effort)
+    try:
+        out = sessionize_network(out)
+    except (ValueError, KeyError, AttributeError) as e:
+        logger.warning(f"sessionize failed: {e}. Setting session.id=None")
+        if "session.id" not in out.columns:
+            out["session.id"] = None
+
+    # Canonical entity key used by rolling flags (source.ip preferred)
+    out["_entity_key"] = out.get("source.ip", pd.Series([None] * len(out))).astype(str).replace({"None": None, "nan": None})
+    if "user.name" in out.columns:
+        out["_entity_key"] = out["_entity_key"].where(out["_entity_key"].notna(), out["user.name"].astype(str))
+    if "host.name" in out.columns:
+        out["_entity_key"] = out["_entity_key"].where(out["_entity_key"].notna(), out["host.name"].astype(str))
+    out["_entity_key"] = out["_entity_key"].fillna("unknown")
+
+    # Rolling counts for key flags
+    for flag in ["login_failed", "conn_suspicious", "action_deny", "action_allow", "ips_alert"]:
+        out = add_time_window_counts(out, ["_entity_key"], "@timestamp", flag, [1, 5, 15], col_suffix=None)
+        out = add_time_window_counts(out, ["host.name"], "@timestamp", flag, [1, 5, 15], col_suffix="host")
+        out = add_time_window_counts(out, ["user.name"], "@timestamp", flag, [1, 5, 15], col_suffix="user")
+        out = add_time_window_counts(out, ["destination.ip"], "@timestamp", flag, [1, 5, 15], col_suffix="dst")
+
+    for flag in ["cbs_failed"]:
+        out = add_time_window_counts(out, ["host.name"], "@timestamp", flag, [1, 5, 15], col_suffix="host")
+        out = add_time_window_counts(out, ["process.name"], "@timestamp", flag, [1, 5, 15], col_suffix="proc")
+
+    # Unique rolling metrics
+    out = _add_rolling_nunique(out, ["source.ip"], "@timestamp", "destination.ip", [1, 5, 15], "uniq_dst_per_src")
+    out = _add_rolling_nunique(out, ["destination.ip"], "@timestamp", "source.ip", [1, 5, 15], "uniq_src_per_dst")
+    out = _add_rolling_nunique(out, ["source.ip"], "@timestamp", "destination.port", [1, 5, 15], "uniq_dport_per_src")
+
+    # Bytes/packets rolling sums
+    out = _add_time_window_sum(out, ["host.name"], "@timestamp", "network.bytes", [1, 5, 15])
+    out = _add_time_window_sum(out, ["host.name"], "@timestamp", "network.packets", [1, 5, 15])
+    out = _add_time_window_sum(out, ["source.ip"], "@timestamp", "network.bytes", [1, 5, 15])
+    out = _add_time_window_sum(out, ["source.ip"], "@timestamp", "network.packets", [1, 5, 15])
+    out = _add_time_window_sum(out, ["destination.ip"], "@timestamp", "network.bytes", [1, 5, 15])
+    out = _add_time_window_sum(out, ["destination.ip"], "@timestamp", "network.packets", [1, 5, 15])
+
+    # Ratios
+    for w in [1, 5, 15]:
+        allow_col = f"action_allow_count_{w}m"
+        deny_col = f"action_deny_count_{w}m"
+        if allow_col in out.columns and deny_col in out.columns:
+            out[f"deny_ratio_{w}m"] = out[deny_col] / (out[deny_col] + out[allow_col] + 1e-6)
+
+    for w in [1, 5, 15]:
+        fail_col = f"login_failed_count_{w}m"
+        allow_col = f"action_allow_count_{w}m"
+        deny_col = f"action_deny_count_{w}m"
+        if fail_col in out.columns and allow_col in out.columns and deny_col in out.columns:
+            out[f"login_failed_ratio_{w}m"] = out[fail_col] / (out[fail_col] + out[allow_col] + out[deny_col] + 1e-6)
+
+    # Select feature columns (same logic as large mode)
+    base_features = [
+        "login_failed",
+        "conn_suspicious",
+        "action_allow",
+        "action_deny",
+        "ips_alert",
+        "text_entropy",
+        "process.command_line_entropy",
+        "message_entropy",
+        "cbs_failed",
+    ]
+
+    window_features: list[str] = []
+    windows = [1, 5, 15]
+    flags_for_windowing = ["login_failed", "conn_suspicious", "cbs_failed", "action_allow", "action_deny", "ips_alert"]
+    for w in windows:
+        for flag in flags_for_windowing:
+            col = f"{flag}_count_{w}m"
+            if col in out.columns:
+                window_features.append(col)
+            for suf in ["host", "user", "dst", "proc"]:
+                vcol = f"{flag}_count_{suf}_{w}m"
+                if vcol in out.columns:
+                    window_features.append(vcol)
+
+    ratio_features = [c for c in out.columns if c.startswith("deny_ratio_")]
+    ratio_features += [c for c in out.columns if c.startswith("login_failed_ratio_")]
+    uniq_features = [c for c in out.columns if c.startswith("uniq_")]
+    traffic_sums = [c for c in out.columns if c.endswith(("_sum_1m", "_sum_5m", "_sum_15m"))]
+
+    feature_cols = base_features + window_features + ratio_features + uniq_features + traffic_sums
+
+    id_cols = [
+        "@timestamp",
+        "host.name",
+        "user.name",
+        "source.ip",
+        "source.port",
+        "destination.ip",
+        "destination.port",
+        "session.id",
+        "event.action",
+        "event.module",
+        "event.dataset",
+        "event.severity",
+        "network.protocol",
+        "labels.is_attack",
+        "labels.attack_type",
+    ]
+    for c in id_cols:
+        if c not in out.columns:
+            out[c] = None
+
+    feat = out[id_cols + feature_cols].copy()
+
+    # Slice to window if requested
+    if window_start or window_end:
+        ws = pd.to_datetime(window_start, utc=True, errors="coerce") if window_start else None
+        we = pd.to_datetime(window_end, utc=True, errors="coerce") if window_end else None
+        if ws is not None:
+            feat = feat[feat["@timestamp"] >= ws]
+        if we is not None:
+            feat = feat[feat["@timestamp"] <= we]
+
+    return feat.reset_index(drop=True)

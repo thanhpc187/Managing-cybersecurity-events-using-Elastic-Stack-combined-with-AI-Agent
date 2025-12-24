@@ -28,10 +28,33 @@ st.title("📊 Báo cáo kết quả SIEM + AI Agent (One-page)")
 paths = get_paths()
 scores_path = Path(paths["scores_dir"]) / "scores.parquet"
 eval_report_path = Path(paths["scores_dir"]) / "evaluate_report.json"
+windows_root = Path(paths["scores_dir"]).resolve().parents[0] / "windows"
 
-if not scores_path.exists():
-    st.warning("Chưa có dữ liệu scores. Hãy chạy ingest → featurize → train → score trước.")
-    st.stop()
+
+def _find_latest_window_scores() -> Path | None:
+    if not windows_root.exists():
+        return None
+    # Pick newest by folder name: windows/YYYY-MM-DD/(NORMAL|ANOMALY)/<window_id>/scores_window.parquet
+    candidates = list(windows_root.glob("**/scores_window.parquet"))
+    if not candidates:
+        return None
+    # Use path string sorting; window_id includes timestamps so this works well enough for demo
+    return sorted(candidates, key=lambda p: str(p))[-1]
+
+mode = "Batch (scores.parquet)"
+latest_window_scores = _find_latest_window_scores()
+if latest_window_scores is not None:
+    mode = st.sidebar.selectbox("Chế độ dữ liệu", ["Windows (latest 10m)", "Batch (scores.parquet)"], index=0)
+
+if mode.startswith("Windows"):
+    if latest_window_scores is None:
+        st.warning("Chưa có window scores. Hãy chạy `python -m cli.anom_score session ...` trước.")
+        st.stop()
+    scores_path = latest_window_scores
+else:
+    if not scores_path.exists():
+        st.warning("Chưa có dữ liệu scores. Hãy chạy ingest → featurize → train → score trước.")
+        st.stop()
 
 df = pd.read_parquet(scores_path)
 if "@timestamp" in df.columns:
