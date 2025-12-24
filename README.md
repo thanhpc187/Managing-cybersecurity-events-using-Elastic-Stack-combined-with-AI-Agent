@@ -3,41 +3,38 @@
 [![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Hệ thống phát hiện bất thường (anomaly detection) trong log an ninh mạng sử dụng Elastic Common Schema (ECS), Machine Learning (Isolation Forest), và AI Agent để phân tích và ánh xạ MITRE ATT&CK + NIST CSF 2.0.
+Hệ thống demo/POC phát hiện bất thường (anomaly detection) trên log an ninh mạng sử dụng **Elastic Common Schema (ECS)**, **Machine Learning (Isolation Forest)** và **mapping chuẩn MITRE ATT&CK + NIST CSF 2.0**, kèm giao diện **Streamlit** để báo cáo kết quả.
 
-## 📋 Tổng quan
+## Tổng quan
 
-Dự án này là một hệ thống end-to-end giúp:
-- **Thu thập và chuẩn hóa log** từ nhiều nguồn (Windows Security, Sysmon, Zeek, Syslog, FortiGate, IPS, Beats/Packetbeat/Filebeat/Winlogbeat) về chuẩn ECS
-- **Phát hiện bất thường** sử dụng Isolation Forest (unsupervised learning)
-- **Trích xuất đặc trưng** theo thời gian, hành vi đăng nhập và lưu lượng mạng
-- **Ánh xạ chuẩn an ninh**: MITRE ATT&CK (tactic/technique) và NIST CSF 2.0 (Function/Category/Subcategory)
-- **Phân tích bằng AI Agent** (DeepSeek/Gemini) để diễn giải alert, ước lượng mức rủi ro và gợi ý hành động phản ứng
-- **Trình bày kết quả** trên giao diện Streamlit một trang dành cho báo cáo SOC
+Dự án hỗ trợ một workflow end-to-end:
+- **Thu thập log** từ nhiều nguồn (syslog/network/firewall/Windows/Beats…) hoặc từ **Elasticsearch**
+- **Chuẩn hóa về ECS** để gom dữ liệu đa nguồn về một schema thống nhất
+- **Trích xuất đặc trưng (feature engineering)** theo cửa sổ thời gian (rolling counts/ratios/unique/entropy/session…)
+- **Huấn luyện & chấm điểm bất thường** bằng **Isolation Forest** (unsupervised) → sinh cột `anom.score`
+- **Sinh cảnh báo (alerts)** dựa trên **threshold** và **top-N**
+- **Gán nhãn MITRE/NIST** (rule-based từ YAML) để đưa vào báo cáo
+- **Hiển thị dashboard Streamlit**: tổng quan, phân phối `anom.score`, MITRE/NIST, timeline và bảng alert
 
-## ✨ Tính năng chính
+## Chức năng hiện tại (đúng theo repo)
 
-- 🔍 **Multi-source Log Ingestion**: Hỗ trợ Windows Event Logs, Sysmon, Zeek, Syslog, **FortiGate firewall**, **IPS (Snort/Suricata)**, **Packetbeat/Filebeat/Winlogbeat** và (tùy chọn) ingest từ Elasticsearch
-- 📊 **ECS Normalization**: Chuẩn hóa tất cả log về Elastic Common Schema
-- 🤖 **Anomaly Detection**: Sử dụng Isolation Forest để phát hiện bất thường không cần nhãn
-- 📈 **Feature Engineering**: 
-  - Time-window features (1/5/15 phút)
-  - Entropy analysis cho command lines / message
-  - Sessionization theo 5-tuple network
-  - **Network metrics**: deny/allow ratio, uniq IP/port per window, bytes/packets per window
-- 🧠 **AI-Powered Analysis**: Tích hợp AI Agent (DeepSeek/Gemini) để phân tích alert, ước lượng risk level, trích IOC và gợi ý hành động (PowerShell/SOAR)
-- 🧩 **MITRE ATT&CK + NIST CSF 2.0 Mapping**:
-  - Rule-based từ `config/mitre_mapping.yaml` và `config/nist_csf_mapping.yaml`
-  - Heuristic mapping từ nội dung log và đặc trưng
-  - Fallback LLM (Gemini) để suy luận MITRE/NIST khi rule không khớp
-- 📦 **Forensic Bundles (tùy chọn)**: Tự động tạo gói pháp chứng với:
-  - Raw logs (±5 phút context)
-  - Feature vectors
-  - SHAP explanations
-  - Model metadata
-  - SHA256 manifest và chain-of-custody
-- 🖥️ **Streamlit Dashboard (one-page)**: Giao diện web để xem tổng quan dữ liệu, phân phối anom.score, risk level, ánh xạ MITRE/NIST, timeline alert và bảng alert chi tiết
-- ⚡ **CLI Tools**: Typer-based CLI để chạy pipeline từng bước, đánh giá mô hình hoặc end-to-end
+- **Ingest (files / Elasticsearch)**:
+  - `python -m cli.anom_score ingest ...`
+- **Featurize**:
+  - `python -m cli.anom_score featurize ...`
+- **Train (Isolation Forest)**:
+  - `python -m cli.anom_score train`
+- **Score (anom.score)**:
+  - `python -m cli.anom_score score ...`
+- **Threshold + Alerts**:
+  - tính threshold theo `contamination` trong `config/models.yaml`
+  - chọn top alerts theo `top_n`
+- **MITRE ATT&CK + NIST CSF 2.0 (rule-based)**:
+  - cấu hình tại `config/mitre_mapping.yaml` và `config/nist_csf_mapping.yaml`
+- **Session mode (chạy theo cửa sổ 10 phút + retrain theo ngày)**:
+  - `python -m cli.anom_score session ...`
+- **UI Streamlit (1 trang)**:
+  - `streamlit run ui/streamlit_app.py`
 
 ## 📖 Hướng dẫn sử dụng (pipeline chính)
 
@@ -86,15 +83,12 @@ streamlit run ui/streamlit_app.py
 
 ## MITRE ATT&CK & NIST CSF 2.0 Mapping
 
-- Rule MITRE cấu hình tại `config/mitre_mapping.yaml` (ví dụ: brute force T1110, remote service T1021, port scan T1046).
-- Rule NIST CSF 2.0 cấu hình tại `config/nist_csf_mapping.yaml`, ánh xạ từ các kỹ thuật MITRE sang Function/Category/Subcategory.
-- Điều kiện rule hỗ trợ so sánh số (`>`, `>=`, `<`, `<=`, `==`) và khớp chuỗi/danh sách.
-- AI Agent và UI:
-  - Tự động gán tactic/technique (MITRE) và Function (NIST) cho từng alert.
-  - Thông tin này được:
-    - Ghi vào `ai_analysis.json`/`.md` trong bundle (nếu bật bundle).
-    - Hiển thị trên UI (bar chart + bảng và bộ lọc MITRE/NIST).
-- Muốn thêm rule mới: bổ sung mục mới vào YAML với `id/description/tactic/technique/subtechnique/conditions`, không cần sửa code.
+- **MITRE**: rule cấu hình tại `config/mitre_mapping.yaml` (match theo field/feature).
+- **NIST CSF 2.0**: cấu hình tại `config/nist_csf_mapping.yaml` (map từ MITRE technique → Function/Category/Subcategory).
+- Rule hỗ trợ:
+  - so sánh số (`>`, `>=`, `<`, `<=`, `==`)
+  - khớp chuỗi/danh sách (case-insensitive)
+- Thông tin MITRE/NIST được hiển thị trên UI (bar chart + bảng + bộ lọc).
 
 ### Thêm dữ liệu mới
 
@@ -118,11 +112,10 @@ python -m cli.anom_score validate   # Khuyến nghị
 
 Các file cấu hình nằm trong thư mục `config/`:
 
-- **`config/paths.yaml`**: Đường dẫn thư mục (data, models, bundles, ...) và thông số mạng:
+- **`config/paths.yaml`**: Đường dẫn thư mục (data, models, ...) và thông số mạng:
   - `elastic_host`, `elastic_index_patterns`, `fortigate_syslog_port=5514`, `ips_syslog_port=514`, `beats_port=5044`
 - **`config/models.yaml`**: Tham số mô hình (Isolation Forest, threshold, top_n, ...)
 - **`config/ecs_mapping.yaml`**: Mapping từ raw log fields sang ECS fields
-- **`config/policy.yaml`**: Policy rules cho SOAR actions
 - **`config/mitre_mapping.yaml`**: Rule ánh xạ alert/feature → MITRE ATT&CK
 - **`config/nist_csf_mapping.yaml`**: Rule ánh xạ từ MITRE technique → NIST CSF 2.0
 
@@ -139,7 +132,7 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 │   ├── ecs_mapping.yaml
 │   ├── mitre_mapping.yaml
 │   ├── nist_csf_mapping.yaml
-│   └── policy.yaml
+│   └── policy.yaml            # (không dùng trong phạm vi báo cáo hiện tại)
 ├── sample_data/              # Dữ liệu mẫu (demo / thử nghiệm)
 ├── parsers/                  # Log parsers và ECS mapper
 │   ├── base_reader.py
@@ -171,10 +164,8 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 │   ├── ingest.py
 │   ├── build_store.py
 │   ├── alerting.py
-│   ├── bundle.py            # Forensic bundle creation (tùy chọn)
-│   ├── coc.py               # Chain of custody
-│   ├── respond.py           # SOAR response actions
-│   └── run_demo.py          # End-to-end demo
+│   ├── session_runner.py    # Session mode (10 phút/window + retrain theo ngày)
+│   └── run_demo.py          # End-to-end demo (ingest→featurize→train→score)
 ├── ai/                       # AI Agent & mapping frameworks
 │   ├── agent.py             # AI analysis và action suggestions
 │   ├── mitre_mapper.py      # Rule-based MITRE mapping
@@ -192,8 +183,8 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 │   ├── features/            # Feature tables
 │   ├── models/              # Trained models
 │   └── scores/              # Anomaly scores
-└── bundles/                  # Forensic bundles (gitignored, tùy chọn)
-    └── alert_*.zip
+└── bundles/                  # (Không dùng trong phạm vi báo cáo hiện tại)
+    └── ...
 ```
 
 ## 🎯 Workflow (tóm tắt)
@@ -202,8 +193,7 @@ Managing-cybersecurity-events-using-Elastic-Stack-combined-with-AI-Agent/
 2. **Featurize**: trích xuất đặc trưng theo thời gian, hành vi đăng nhập, kết nối mạng.
 3. **Train**: huấn luyện Isolation Forest trên log “bình thường” (nếu cần).
 4. **Score**: tính `anom.score` cho từng record và xác định alerts theo threshold.
-5. **(Tùy chọn) Bundle**: tạo forensic bundles + AI analysis chi tiết.
-6. **UI**: mở Streamlit để xem báo cáo một trang (tổng quan, MITRE/NIST, timeline, bảng alert).
+5. **UI**: mở Streamlit để xem báo cáo một trang (tổng quan, MITRE/NIST, timeline, bảng alert).
 
 ## ⚖️ Copyright
 
